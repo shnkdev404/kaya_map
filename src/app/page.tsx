@@ -7,6 +7,7 @@ import StatsHeader from "@/components/Dashboard/StatsHeader";
 import DeviceCard from "@/components/Dashboard/DeviceCard";
 import SimulatorModal from "@/components/Dashboard/SimulatorModal";
 import GeofenceModal from "@/components/Dashboard/GeofenceModal";
+import StationCalibrateModal from "@/components/Dashboard/StationCalibrateModal";
 import { DeviceTelemetry, SimulationProfile, GeofenceZone, GeofenceAlert } from "@/lib/types";
 import { 
   calculateDistanceMeters, 
@@ -46,7 +47,9 @@ import {
   PenTool,
   Undo2,
   Hexagon,
-  Circle
+  Circle,
+  Crosshair,
+  Satellite
 } from "lucide-react";
 import Link from "next/link";
 
@@ -103,10 +106,13 @@ export default function DashboardPage() {
   const [simProfiles, setSimProfiles] = useState<SimulationProfile[]>([]);
   const simAnglesRef = useRef<Record<string, number>>({});
 
-  // Laptop Base Station & Location State (Active by default as Server Origin)
+  // Laptop Base Station & Precise Calibration State
   const [isLaptopStationActive, setIsLaptopStationActive] = useState(true);
   const [laptopLocation, setLaptopLocation] = useState<{ lat: number; lon: number; accuracy: number; altitude: number | null; label?: string } | null>(null);
   const [isRefreshingGps, setIsRefreshingGps] = useState(false);
+  const [isCalibrateModalOpen, setIsCalibrateModalOpen] = useState(false);
+  const [isPinpointingStation, setIsPinpointingStation] = useState(false);
+  const isCustomStationCalibratedRef = useRef(false);
   const laptopWatchIdRef = useRef<number | null>(null);
   const initialOriginSetRef = useRef(false);
 
@@ -185,23 +191,55 @@ export default function DashboardPage() {
     }
   };
 
+  // Handlers for Station Calibration & Persistence
+  const handleSaveStationCalibration = (lat: number, lon: number, accuracy: number, label: string) => {
+    isCustomStationCalibratedRef.current = true;
+    if (typeof window !== "undefined") {
+      localStorage.setItem("kaya_custom_station", JSON.stringify({ lat, lon, accuracy, label, altitude: 0 }));
+    }
+    syncServerStation(lat, lon, accuracy, null, label);
+    setFocusCoords([lat, lon]);
+    setIsPinpointingStation(false);
+  };
+
+  const handleResetToAutoGps = () => {
+    isCustomStationCalibratedRef.current = false;
+    if (typeof window !== "undefined") {
+      localStorage.removeItem("kaya_custom_station");
+    }
+    handleRefreshServerGps();
+  };
+
   useEffect(() => {
     if (typeof window !== "undefined") {
       setHostUrl(window.location.host);
 
+      // Check if user has previously calibrated base station
+      try {
+        const saved = localStorage.getItem("kaya_custom_station");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed.lat && parsed.lon) {
+            isCustomStationCalibratedRef.current = true;
+            syncServerStation(parsed.lat, parsed.lon, parsed.accuracy || 1.5, parsed.altitude || null, parsed.label || "Calibrated Base Station");
+          }
+        }
+      } catch (e) {}
+
       // 1. Fast IP-based resolution for instant origin coordinates
       const fetchFastIp = async () => {
+        if (isCustomStationCalibratedRef.current) return;
         try {
           const res = await fetch("https://ipwho.is/");
           const data = await res.json();
-          if (data && data.latitude && data.longitude) {
+          if (!isCustomStationCalibratedRef.current && data && data.latitude && data.longitude) {
             syncServerStation(data.latitude, data.longitude, 500, null, `${data.city || ""}, ${data.region || ""}`);
           }
         } catch (e) {
           try {
             const res2 = await fetch("https://ipapi.co/json/");
             const data2 = await res2.json();
-            if (data2 && data2.latitude && data2.longitude) {
+            if (!isCustomStationCalibratedRef.current && data2 && data2.latitude && data2.longitude) {
               syncServerStation(data2.latitude, data2.longitude, 500, null, `${data2.city || ""}, ${data2.region || ""}`);
             }
           } catch (e2) {}
@@ -214,6 +252,7 @@ export default function DashboardPage() {
       if (navigator.geolocation) {
         const watchId = navigator.geolocation.watchPosition(
           (pos) => {
+            if (isCustomStationCalibratedRef.current) return;
             const c = pos.coords;
             syncServerStation(c.latitude, c.longitude, c.accuracy || 8, c.altitude, "Live GPS Fix");
           },
@@ -969,8 +1008,64 @@ export default function DashboardPage() {
               isDrawingWaypoints={isDrawingWaypoints}
               drawingWaypoints={drawingWaypoints}
               onAddDrawingWaypoint={(coords) => setDrawingWaypoints((prev) => [...prev, coords])}
+              onMapClickCoords={(lat, lon) => {
+                if (isPinpointingStation) {
+                  handleSaveStationCalibration(lat, lon, 1.5, "Calibrated from Satellite Map");
+                }
+              }}
               drawingColor="#059669"
             />
+
+            {/* Floating Pinpoint Base Station Mode Banner */}
+            {isPinpointingStation && (
+              <div style={{
+                position: "absolute",
+                top: "16px",
+                left: "50%",
+                transform: "translateX(-50%)",
+                zIndex: 1000,
+                backgroundColor: "#ffffff",
+                border: "2px solid #2563eb",
+                borderRadius: "var(--radius-md)",
+                padding: "10px 18px",
+                boxShadow: "0 8px 24px rgba(37, 99, 235, 0.25)",
+                display: "flex",
+                alignItems: "center",
+                gap: "12px",
+                animation: "fadeIn 0.2s ease"
+              }}>
+                <div style={{
+                  width: "10px",
+                  height: "10px",
+                  borderRadius: "50%",
+                  backgroundColor: "#2563eb"
+                }} className="pulse-active" />
+                <div style={{ display: "flex", flexDirection: "column" }}>
+                  <span style={{ fontSize: "12px", fontWeight: 800, color: "#1e40af" }}>
+                    🎯 Pinpoint Base Station Active
+                  </span>
+                  <span style={{ fontSize: "11px", color: "#3b82f6" }}>
+                    Click anywhere on the map to set your laptop base station origin (±1m precision)
+                  </span>
+                </div>
+                <button
+                  onClick={() => setIsPinpointingStation(false)}
+                  style={{
+                    padding: "5px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "#f1f5f9",
+                    border: "1px solid #cbd5e1",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    color: "#475569",
+                    cursor: "pointer",
+                    marginLeft: "6px"
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
 
             {/* Floating Interactive Waypoint Drawing Action Bar */}
             {isDrawingWaypoints && (
@@ -1281,40 +1376,71 @@ export default function DashboardPage() {
                       ) : isServerStation && (
                         <div style={{
                           backgroundColor: "#f8fafc",
-                          border: "1px solid #e2e8f0",
+                          border: "1px solid #bfdbfe",
                           borderRadius: "var(--radius-md)",
                           padding: "10px 14px",
                           display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between"
+                          flexDirection: "column",
+                          gap: "8px"
                         }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                            <div style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#2563eb" }} className="pulse-active" />
-                            <span style={{ fontSize: "12px", fontWeight: 700, color: "#1e40af" }}>
-                              Host Reference Center
-                            </span>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                              <div style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#2563eb" }} className="pulse-active" />
+                              <span style={{ fontSize: "12px", fontWeight: 700, color: "#1e40af" }}>
+                                {laptopLocation?.label || "Base Command Origin"}
+                              </span>
+                            </div>
+                            <button
+                              onClick={() => setIsCalibrateModalOpen(true)}
+                              title="Calibrate or pinpoint laptop base station"
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "4px",
+                                background: "#2563eb",
+                                border: "none",
+                                borderRadius: "6px",
+                                padding: "4px 8px",
+                                fontSize: "11px",
+                                fontWeight: 700,
+                                color: "#ffffff",
+                                cursor: "pointer",
+                                boxShadow: "0 2px 6px rgba(37, 99, 235, 0.25)"
+                              }}
+                            >
+                              <Crosshair size={12} />
+                              <span>Calibrate Position</span>
+                            </button>
                           </div>
-                          <button
-                            onClick={handleRefreshServerGps}
-                            disabled={isRefreshingGps}
-                            title="Recalibrate / Refresh Laptop GPS fix"
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: "4px",
-                              background: "none",
-                              border: "1px solid #bfdbfe",
-                              borderRadius: "6px",
-                              padding: "4px 8px",
-                              fontSize: "11px",
-                              fontWeight: 700,
-                              color: "#2563eb",
-                              cursor: "pointer"
-                            }}
-                          >
-                            <RefreshCw size={12} className={isRefreshingGps ? "spin-icon" : ""} />
-                            <span>{isRefreshingGps ? "Acquiring..." : "Calibrate GPS"}</span>
-                          </button>
+
+                          {/* Quick 1-Click Phone Satellite Sync if phone is connected */}
+                          {(() => {
+                            const phoneDev = devices.find((d) => d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster");
+                            if (!phoneDev) return null;
+                            return (
+                              <button
+                                onClick={() => handleSaveStationCalibration(phoneDev.lat, phoneDev.lon, Math.min(phoneDev.accuracy_m || 2, 3), "Synced from Phone GNSS")}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  gap: "6px",
+                                  width: "100%",
+                                  padding: "6px",
+                                  borderRadius: "6px",
+                                  backgroundColor: "#f0fdf4",
+                                  border: "1px solid #bbf7d0",
+                                  color: "#166534",
+                                  fontSize: "11px",
+                                  fontWeight: 700,
+                                  cursor: "pointer"
+                                }}
+                              >
+                                <Satellite size={13} />
+                                <span>1-Click Sync to Phone GPS (±{Math.round(phoneDev.accuracy_m || 2)}m)</span>
+                              </button>
+                            );
+                          })()}
                         </div>
                       )}
 
@@ -1684,6 +1810,20 @@ export default function DashboardPage() {
           setSimProfiles((prev) => prev.filter((p) => p.id !== id));
           setDevices((prev) => prev.filter((d) => d.device_id !== id));
         }}
+      />
+
+      {/* Station Precision Calibrator Modal */}
+      <StationCalibrateModal
+        isOpen={isCalibrateModalOpen}
+        onClose={() => setIsCalibrateModalOpen(false)}
+        currentLat={laptopLocation?.lat || 0}
+        currentLon={laptopLocation?.lon || 0}
+        currentAccuracy={laptopLocation?.accuracy || 5}
+        label={laptopLocation?.label}
+        phoneDevice={devices.find((d) => d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster")}
+        onSaveCalibration={handleSaveStationCalibration}
+        onStartMapPinpoint={() => setIsPinpointingStation(true)}
+        onResetToAutoGps={handleResetToAutoGps}
       />
     </div>
   );
