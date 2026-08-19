@@ -56,3 +56,94 @@ export function formatSpeedKmh(mps: number | null | undefined): string {
   if (!mps || mps <= 0.05) return "0.0 km/h";
   return `${(mps * 3.6).toFixed(1)} km/h`;
 }
+
+/**
+ * Ray-Casting Point-in-Polygon (PIP) Algorithm
+ * Accurately determines whether a coordinate [lat, lon] is strictly inside a waypoint perimeter polygon.
+ */
+export function isPointInPolygon(
+  point: [number, number],
+  waypoints: [number, number][]
+): boolean {
+  if (!waypoints || waypoints.length < 3) return false;
+
+  const [lat, lon] = point;
+  let inside = false;
+
+  for (let i = 0, j = waypoints.length - 1; i < waypoints.length; j = i++) {
+    const [latI, lonI] = waypoints[i];
+    const [latJ, lonJ] = waypoints[j];
+
+    const intersect =
+      lonI > lon !== lonJ > lon &&
+      lat < ((latJ - latI) * (lon - lonI)) / (lonJ - lonI) + latI;
+
+    if (intersect) inside = !inside;
+  }
+
+  return inside;
+}
+
+/**
+ * Computes geographic centroid (center of mass) of a waypoint polygon
+ */
+export function calculatePolygonCentroid(waypoints: [number, number][]): [number, number] {
+  if (!waypoints || waypoints.length === 0) return [0, 0];
+  let latSum = 0;
+  let lonSum = 0;
+  waypoints.forEach(([lat, lon]) => {
+    latSum += lat;
+    lonSum += lon;
+  });
+  return [latSum / waypoints.length, lonSum / waypoints.length];
+}
+
+/**
+ * Computes total closed perimeter distance in meters for a sequence of waypoints
+ */
+export function calculatePolygonPerimeterMeters(waypoints: [number, number][]): number {
+  if (!waypoints || waypoints.length < 2) return 0;
+  let total = 0;
+  for (let i = 0; i < waypoints.length; i++) {
+    const next = (i + 1) % waypoints.length;
+    total += calculateDistanceMeters(
+      waypoints[i][0],
+      waypoints[i][1],
+      waypoints[next][0],
+      waypoints[next][1]
+    );
+  }
+  return total;
+}
+
+/**
+ * Computes approximate enclosed geodesic surface area in square meters
+ */
+export function calculatePolygonAreaMeters(waypoints: [number, number][]): number {
+  if (!waypoints || waypoints.length < 3) return 0;
+  const R = 6371e3; // Radius of earth in meters
+  let area = 0;
+
+  for (let i = 0; i < waypoints.length; i++) {
+    const j = (i + 1) % waypoints.length;
+    const lat1 = (waypoints[i][0] * Math.PI) / 180;
+    const lat2 = (waypoints[j][0] * Math.PI) / 180;
+    const lon1 = (waypoints[i][1] * Math.PI) / 180;
+    const lon2 = (waypoints[j][1] * Math.PI) / 180;
+
+    area += (lon2 - lon1) * (2 + Math.sin(lat1) + Math.sin(lat2));
+  }
+
+  area = (Math.abs(area) * R * R) / 2.0;
+  return area;
+}
+
+export function formatArea(sqMeters: number): string {
+  if (sqMeters >= 1000000) {
+    return `${(sqMeters / 1000000).toFixed(2)} km²`;
+  }
+  if (sqMeters >= 10000) {
+    return `${(sqMeters / 10000).toFixed(2)} hectares`;
+  }
+  return `${Math.round(sqMeters).toLocaleString()} m²`;
+}

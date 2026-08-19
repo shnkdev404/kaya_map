@@ -8,7 +8,17 @@ import DeviceCard from "@/components/Dashboard/DeviceCard";
 import SimulatorModal from "@/components/Dashboard/SimulatorModal";
 import GeofenceModal from "@/components/Dashboard/GeofenceModal";
 import { DeviceTelemetry, SimulationProfile, GeofenceZone, GeofenceAlert } from "@/lib/types";
-import { calculateDistanceMeters, formatDistance, calculateSpeedMps, formatSpeedKmh } from "@/lib/geo";
+import { 
+  calculateDistanceMeters, 
+  formatDistance, 
+  calculateSpeedMps, 
+  formatSpeedKmh,
+  isPointInPolygon,
+  calculatePolygonCentroid,
+  calculatePolygonPerimeterMeters,
+  calculatePolygonAreaMeters,
+  formatArea
+} from "@/lib/geo";
 import { GPSKalmanFilter } from "@/lib/kalman";
 import { 
   Radio, 
@@ -32,7 +42,11 @@ import {
   Copy,
   Check,
   Trash2,
-  RefreshCw
+  RefreshCw,
+  PenTool,
+  Undo2,
+  Hexagon,
+  Circle
 } from "lucide-react";
 import Link from "next/link";
 
@@ -75,9 +89,11 @@ export default function DashboardPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>("all");
   
-  // Geofencing State
+  // Geofencing & Waypoint Marking State
   const [geofences, setGeofences] = useState<GeofenceZone[]>([]);
   const [isGeofenceModalOpen, setIsGeofenceModalOpen] = useState(false);
+  const [isDrawingWaypoints, setIsDrawingWaypoints] = useState(false);
+  const [drawingWaypoints, setDrawingWaypoints] = useState<[number, number][]>([]);
   const [geofenceAlerts, setGeofenceAlerts] = useState<GeofenceAlert[]>([]);
   const previousContainmentRef = useRef<Record<string, Record<string, boolean>>>({});
 
@@ -400,8 +416,18 @@ export default function DashboardPage() {
       geofences.forEach((zone) => {
         if (!zone.enabled) return;
 
-        const distance = calculateDistanceMeters(device.lat, device.lon, zone.center[0], zone.center[1]);
-        const isInside = distance <= zone.radiusMeters;
+        const isPoly = zone.type === "polygon" && zone.waypoints && zone.waypoints.length >= 3;
+        let isInside = false;
+        let distance = 0;
+
+        if (isPoly && zone.waypoints) {
+          isInside = isPointInPolygon([device.lat, device.lon], zone.waypoints);
+          distance = calculateDistanceMeters(device.lat, device.lon, zone.center[0], zone.center[1]);
+        } else {
+          distance = calculateDistanceMeters(device.lat, device.lon, zone.center[0], zone.center[1]);
+          isInside = distance <= zone.radiusMeters;
+        }
+
         const prevInside = previousContainmentRef.current[device.device_id]?.[zone.id];
 
         if (prevInside !== undefined && prevInside !== isInside) {
@@ -940,7 +966,99 @@ export default function DashboardPage() {
               geofences={geofences}
               focusCoords={focusCoords}
               serverOrigin={laptopLocation ? [laptopLocation.lat, laptopLocation.lon] : null}
+              isDrawingWaypoints={isDrawingWaypoints}
+              drawingWaypoints={drawingWaypoints}
+              onAddDrawingWaypoint={(coords) => setDrawingWaypoints((prev) => [...prev, coords])}
+              drawingColor="#059669"
             />
+
+            {/* Floating Interactive Waypoint Drawing Action Bar */}
+            {isDrawingWaypoints && (
+              <div style={{
+                position: "absolute",
+                bottom: "20px",
+                left: "50%",
+                transform: "translateX(-50%)",
+                zIndex: 1000,
+                backgroundColor: "#ffffff",
+                border: "1.5px solid var(--emerald-primary)",
+                borderRadius: "12px",
+                padding: "8px 14px",
+                boxShadow: "0 10px 30px rgba(0, 0, 0, 0.2)",
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                animation: "fadeIn 0.2s ease"
+              }}>
+                <span style={{ fontSize: "12px", fontWeight: 800, color: "var(--emerald-dark)" }}>
+                  📍 {drawingWaypoints.length} Waypoints
+                </span>
+                <button
+                  onClick={() => setDrawingWaypoints((prev) => prev.slice(0, -1))}
+                  disabled={drawingWaypoints.length === 0}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    padding: "6px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "#f1f5f9",
+                    border: "1px solid var(--border-light)",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    cursor: drawingWaypoints.length === 0 ? "not-allowed" : "pointer"
+                  }}
+                >
+                  <Undo2 size={13} />
+                  <span>Undo Point</span>
+                </button>
+                <button
+                  onClick={() => {
+                    if (drawingWaypoints.length < 3) {
+                      alert("Please click at least 3 waypoints on the map to enclose a region.");
+                      return;
+                    }
+                    setIsGeofenceModalOpen(true);
+                  }}
+                  disabled={drawingWaypoints.length < 3}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    padding: "6px 12px",
+                    borderRadius: "6px",
+                    backgroundColor: drawingWaypoints.length < 3 ? "#94a3b8" : "var(--emerald-primary)",
+                    color: "#ffffff",
+                    border: "none",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    cursor: drawingWaypoints.length < 3 ? "not-allowed" : "pointer",
+                    boxShadow: "0 2px 8px rgba(5, 150, 105, 0.25)"
+                  }}
+                >
+                  <Check size={13} />
+                  <span>Enclose & Save Fence</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setIsDrawingWaypoints(false);
+                    setDrawingWaypoints([]);
+                  }}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "#fee2e2",
+                    color: "#ef4444",
+                    border: "1px solid #fecaca",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    cursor: "pointer"
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
           </section>
 
           {/* RIGHT: Geofencing & Telemetry Inspector */}
@@ -993,33 +1111,37 @@ export default function DashboardPage() {
 
               {geofences.length > 0 ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                  {geofences.map((zone) => (
-                    <div
-                      key={zone.id}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        fontSize: "12px",
-                        padding: "6px 8px",
-                        backgroundColor: "#ffffff",
-                        borderRadius: "6px",
-                        border: "1px solid var(--border-light)"
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                        <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: zone.color }} />
-                        <span style={{ fontWeight: 600, color: "var(--text-main)" }}>{zone.name}</span>
+                  {geofences.map((zone) => {
+                    const isPoly = zone.type === "polygon" && zone.waypoints && zone.waypoints.length >= 3;
+                    const perimeter = isPoly && zone.waypoints ? calculatePolygonPerimeterMeters(zone.waypoints) : 0;
+                    return (
+                      <div
+                        key={zone.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          fontSize: "12px",
+                          padding: "6px 8px",
+                          backgroundColor: "#ffffff",
+                          borderRadius: "6px",
+                          border: "1px solid var(--border-light)"
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                          <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: zone.color }} />
+                          <span style={{ fontWeight: 600, color: "var(--text-main)" }}>{zone.name}</span>
+                        </div>
+                        <span style={{ color: "var(--text-muted)", fontSize: "11px", fontWeight: 700 }}>
+                          {isPoly && zone.waypoints ? `📍 ${zone.waypoints.length} pts · ${formatDistance(perimeter)}` : `🔵 ${formatDistance(zone.radiusMeters)}`}
+                        </span>
                       </div>
-                      <span style={{ color: "var(--text-muted)", fontSize: "11px" }}>
-                        {formatDistance(zone.radiusMeters)}
-                      </span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               ) : (
                 <div style={{ fontSize: "12px", color: "var(--text-muted)", lineHeight: 1.4 }}>
-                  No active boundaries. Click configure to set up a perimeter with latitude, longitude & radius.
+                  No active boundaries. Click configure to set up a circular or multi-waypoint perimeter.
                 </div>
               )}
             </div>
@@ -1528,12 +1650,24 @@ export default function DashboardPage() {
         isOpen={isGeofenceModalOpen}
         onClose={() => setIsGeofenceModalOpen(false)}
         geofences={geofences}
-        onAddGeofence={handleAddGeofence}
+        onAddGeofence={(zone) => {
+          setGeofences((prev) => [...prev, zone]);
+          setIsGeofenceModalOpen(false);
+          setIsDrawingWaypoints(false);
+          setDrawingWaypoints([]);
+        }}
         onToggleGeofence={handleToggleGeofence}
         onRemoveGeofence={handleRemoveGeofence}
         devices={devices}
         selectedDevice={selectedDevice}
         mapCenter={laptopLocation ? [laptopLocation.lat, laptopLocation.lon] : selectedDevice ? [selectedDevice.lat, selectedDevice.lon] : undefined}
+        onStartMapDrawing={() => {
+          setIsGeofenceModalOpen(false);
+          setIsDrawingWaypoints(true);
+          setDrawingWaypoints([]);
+        }}
+        drawnWaypoints={drawingWaypoints}
+        onClearDrawnWaypoints={() => setDrawingWaypoints([])}
       />
 
       {/* Simulator Modal */}

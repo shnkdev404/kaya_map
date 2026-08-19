@@ -40,11 +40,15 @@ export interface SimulationProfile {
   color: string;
 }
 
+export type GeofenceType = 'circle' | 'polygon';
+
 export interface GeofenceZone {
   id: string;
   name: string;
-  center: [number, number]; // [lat, lon]
-  radiusMeters: number;
+  type?: GeofenceType; // 'circle' | 'polygon'
+  center: [number, number]; // [lat, lon] - For circles: center; For polygons: centroid
+  radiusMeters: number; // For circles: radius; For polygons: 0
+  waypoints?: [number, number][]; // [lat, lon] array for multi-waypoint perimeter
   alertOnEnter: boolean;
   alertOnExit: boolean;
   color: string;

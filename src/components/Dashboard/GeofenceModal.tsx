@@ -1,8 +1,16 @@
 "use client";
 
 import React, { useState } from "react";
-import { GeofenceZone, DeviceTelemetry } from "@/lib/types";
-import { calculateDistanceMeters, formatDistance } from "@/lib/geo";
+import { GeofenceZone, DeviceTelemetry, GeofenceType } from "@/lib/types";
+import { 
+  calculateDistanceMeters, 
+  formatDistance, 
+  isPointInPolygon, 
+  calculatePolygonCentroid, 
+  calculatePolygonPerimeterMeters, 
+  calculatePolygonAreaMeters, 
+  formatArea 
+} from "@/lib/geo";
 import { 
   ShieldCheck, 
   Plus, 
@@ -14,7 +22,11 @@ import {
   Target, 
   AlertTriangle,
   Eye,
-  EyeOff
+  EyeOff,
+  Circle,
+  Hexagon,
+  PenTool,
+  RotateCcw
 } from "lucide-react";
 
 interface GeofenceModalProps {
@@ -27,6 +39,9 @@ interface GeofenceModalProps {
   devices: DeviceTelemetry[];
   selectedDevice: DeviceTelemetry | null;
   mapCenter?: [number, number];
+  onStartMapDrawing?: () => void;
+  drawnWaypoints?: [number, number][];
+  onClearDrawnWaypoints?: () => void;
 }
 
 const COLOR_PRESETS = [
@@ -47,14 +62,19 @@ export default function GeofenceModal({
   onRemoveGeofence,
   devices,
   selectedDevice,
-  mapCenter
+  mapCenter,
+  onStartMapDrawing,
+  drawnWaypoints = [],
+  onClearDrawnWaypoints
 }: GeofenceModalProps) {
   const defaultLat = mapCenter ? mapCenter[0].toFixed(6) : "0.000000";
   const defaultLon = mapCenter ? mapCenter[1].toFixed(6) : "0.000000";
+  const [fenceType, setFenceType] = useState<GeofenceType>("circle");
   const [name, setName] = useState("");
   const [lat, setLat] = useState<string>(defaultLat);
   const [lon, setLon] = useState<string>(defaultLon);
   const [radius, setRadius] = useState<number>(300);
+  const [waypoints, setWaypoints] = useState<[number, number][]>([]);
   const [alertOnExit, setAlertOnExit] = useState(true);
   const [alertOnEnter, setAlertOnEnter] = useState(true);
   const [selectedColor, setSelectedColor] = useState("#059669");
@@ -66,6 +86,14 @@ export default function GeofenceModal({
       setLon(mapCenter[1].toFixed(6));
     }
   }, [mapCenter, isOpen]);
+
+  // If waypoints were drawn interactively on map, sync them into modal state
+  React.useEffect(() => {
+    if (drawnWaypoints && drawnWaypoints.length > 0) {
+      setWaypoints(drawnWaypoints);
+      setFenceType("polygon");
+    }
+  }, [drawnWaypoints]);
 
   if (!isOpen) return null;
 
@@ -86,8 +114,57 @@ export default function GeofenceModal({
     }
   };
 
+  // Add waypoint to manual list
+  const handleAddWaypoint = () => {
+    const baseLat = parseFloat(lat) || mapCenter?.[0] || 0;
+    const baseLon = parseFloat(lon) || mapCenter?.[1] || 0;
+    const offset = (waypoints.length + 1) * 0.0015;
+    setWaypoints((prev) => [...prev, [baseLat + offset, baseLon + offset]]);
+  };
+
+  const handleUpdateWaypoint = (index: number, newLat: number, newLon: number) => {
+    setWaypoints((prev) => {
+      const next = [...prev];
+      next[index] = [newLat, newLon];
+      return next;
+    });
+  };
+
+  const handleRemoveWaypoint = (index: number) => {
+    setWaypoints((prev) => prev.filter((_, i) => i !== index));
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+
+    if (fenceType === "polygon") {
+      if (waypoints.length < 3) {
+        alert("A waypoint geofence requires at least 3 waypoints to form an enclosed perimeter.");
+        return;
+      }
+
+      const centroid = calculatePolygonCentroid(waypoints);
+      const newZone: GeofenceZone = {
+        id: `zone-poly-${Date.now()}`,
+        name: name.trim() || `Waypoint Zone ${geofences.length + 1}`,
+        type: "polygon",
+        center: centroid,
+        radiusMeters: 0,
+        waypoints,
+        alertOnEnter,
+        alertOnExit,
+        color: selectedColor,
+        enabled: true
+      };
+
+      onAddGeofence(newZone);
+      setName("");
+      setWaypoints([]);
+      if (onClearDrawnWaypoints) onClearDrawnWaypoints();
+      return;
+    }
+
+    // Circular fence
     const latNum = parseFloat(lat);
     const lonNum = parseFloat(lon);
 
@@ -103,6 +180,7 @@ export default function GeofenceModal({
     const newZone: GeofenceZone = {
       id: `zone-${Date.now()}`,
       name: name.trim() || `Geofence ${geofences.length + 1}`,
+      type: "circle",
       center: [latNum, lonNum],
       radiusMeters: radius,
       alertOnEnter,
@@ -196,11 +274,18 @@ export default function GeofenceModal({
 
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
               {geofences.map((zone) => {
-                // Calculate device containment stats
+                // Calculate device containment stats (Circle vs Polygon)
+                const isPoly = zone.type === "polygon" && zone.waypoints && zone.waypoints.length >= 3;
                 const devicesInside = devices.filter((d) => {
+                  if (isPoly && zone.waypoints) {
+                    return isPointInPolygon([d.lat, d.lon], zone.waypoints);
+                  }
                   const dist = calculateDistanceMeters(d.lat, d.lon, zone.center[0], zone.center[1]);
                   return dist <= zone.radiusMeters;
                 });
+
+                const perimeter = isPoly && zone.waypoints ? calculatePolygonPerimeterMeters(zone.waypoints) : 0;
+                const area = isPoly && zone.waypoints ? calculatePolygonAreaMeters(zone.waypoints) : 0;
 
                 return (
                   <div
@@ -235,11 +320,12 @@ export default function GeofenceModal({
                             backgroundColor: "var(--bg-green-tint)",
                             color: "var(--emerald-dark)"
                           }}>
-                            {formatDistance(zone.radiusMeters)} radius
+                            {isPoly && zone.waypoints ? `📍 ${zone.waypoints.length} Waypoints · ${formatDistance(perimeter)}` : `🔵 ${formatDistance(zone.radiusMeters)} radius`}
                           </span>
                         </div>
                         <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px", fontFamily: "'JetBrains Mono', monospace" }}>
                           {zone.center[0].toFixed(5)}°, {zone.center[1].toFixed(5)}°
+                          {isPoly && area > 0 && ` (${formatArea(area)})`}
                           {devices.length > 0 && (
                             <span style={{ marginLeft: "8px", fontWeight: 600, color: devicesInside.length > 0 ? "var(--emerald-primary)" : "var(--text-muted)" }}>
                               · {devicesInside.length} of {devices.length} devices inside
@@ -298,7 +384,7 @@ export default function GeofenceModal({
                   color: "var(--text-muted)",
                   fontSize: "12px"
                 }}>
-                  No geofences defined yet. Use the form below to create your first boundary.
+                  No geofences defined yet. Use the form below to create a circle or waypoint polygon boundary.
                 </div>
               )}
             </div>
@@ -314,9 +400,55 @@ export default function GeofenceModal({
             flexDirection: "column",
             gap: "14px"
           }}>
-            <div style={{ fontSize: "14px", fontWeight: 800, color: "var(--emerald-dark)", display: "flex", alignItems: "center", gap: "6px" }}>
-              <Plus size={16} />
-              <span>Create New Geofence Zone</span>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ fontSize: "14px", fontWeight: 800, color: "var(--emerald-dark)", display: "flex", alignItems: "center", gap: "6px" }}>
+                <Plus size={16} />
+                <span>Create New Geofence</span>
+              </div>
+
+              {/* Mode Selector Tabs */}
+              <div style={{ display: "flex", gap: "4px", backgroundColor: "#ffffff", padding: "3px", borderRadius: "8px", border: "1px solid var(--border-light)" }}>
+                <button
+                  type="button"
+                  onClick={() => setFenceType("circle")}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "5px",
+                    padding: "4px 10px",
+                    borderRadius: "6px",
+                    border: "none",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    backgroundColor: fenceType === "circle" ? "var(--bg-green-tint)" : "transparent",
+                    color: fenceType === "circle" ? "var(--emerald-primary)" : "var(--text-secondary)"
+                  }}
+                >
+                  <Circle size={13} />
+                  <span>Circle Fence</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFenceType("polygon")}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "5px",
+                    padding: "4px 10px",
+                    borderRadius: "6px",
+                    border: "none",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    backgroundColor: fenceType === "polygon" ? "var(--bg-green-tint)" : "transparent",
+                    color: fenceType === "polygon" ? "var(--emerald-primary)" : "var(--text-secondary)"
+                  }}
+                >
+                  <Hexagon size={13} />
+                  <span>Waypoint Polygon</span>
+                </button>
+              </div>
             </div>
 
             {/* Zone Name */}
@@ -326,7 +458,7 @@ export default function GeofenceModal({
               </label>
               <input
                 type="text"
-                placeholder="e.g. Field Operations Base, Sector Alpha"
+                placeholder={fenceType === "circle" ? "e.g. Field Operations Base, Sector Alpha" : "e.g. Flight Test Perimeter, Perimeter Alpha"}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 style={{
@@ -341,128 +473,341 @@ export default function GeofenceModal({
               />
             </div>
 
-            {/* Latitude & Longitude Coordinates */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
-              <div>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>
-                  Center Latitude (decimal °)
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. 18.520430"
-                  value={lat}
-                  onChange={(e) => setLat(e.target.value)}
-                  style={{
-                    width: "100%",
-                    padding: "9px 12px",
+            {/* CIRCLE MODE INPUTS */}
+            {fenceType === "circle" ? (
+              <>
+                {/* Latitude & Longitude Coordinates */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+                  <div>
+                    <label style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>
+                      Center Latitude (decimal °)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. 18.520430"
+                      value={lat}
+                      onChange={(e) => setLat(e.target.value)}
+                      style={{
+                        width: "100%",
+                        padding: "9px 12px",
+                        borderRadius: "6px",
+                        border: "1px solid var(--border-light)",
+                        fontSize: "13px",
+                        fontFamily: "'JetBrains Mono', monospace",
+                        backgroundColor: "#ffffff",
+                        outline: "none"
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>
+                      Center Longitude (decimal °)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. 73.856743"
+                      value={lon}
+                      onChange={(e) => setLon(e.target.value)}
+                      style={{
+                        width: "100%",
+                        padding: "9px 12px",
+                        borderRadius: "6px",
+                        border: "1px solid var(--border-light)",
+                        fontSize: "13px",
+                        fontFamily: "'JetBrains Mono', monospace",
+                        backgroundColor: "#ffffff",
+                        outline: "none"
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {/* Coordinate Fill Shortcuts */}
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button
+                    type="button"
+                    onClick={handleUseMapCenter}
+                    style={{
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      padding: "5px 10px",
+                      borderRadius: "6px",
+                      backgroundColor: "#ffffff",
+                      border: "1px solid var(--border-light)",
+                      color: "var(--text-secondary)",
+                      cursor: "pointer"
+                    }}
+                  >
+                    📍 Use Map Center
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleUseDeviceLocation}
+                    disabled={devices.length === 0}
+                    style={{
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      padding: "5px 10px",
+                      borderRadius: "6px",
+                      backgroundColor: "#ffffff",
+                      border: "1px solid var(--border-light)",
+                      color: devices.length > 0 ? "var(--emerald-primary)" : "var(--text-muted)",
+                      cursor: devices.length > 0 ? "pointer" : "not-allowed"
+                    }}
+                  >
+                    🎯 Use Device Position
+                  </button>
+                </div>
+
+                {/* Radius Slider & Input */}
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
+                    <label style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)" }}>
+                      Zone Radius: <span style={{ color: "var(--emerald-primary)", fontWeight: 800 }}>{formatDistance(radius)}</span>
+                    </label>
+                    <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>50m to 10,000m</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <input
+                      type="range"
+                      min="50"
+                      max="5000"
+                      step="50"
+                      value={radius}
+                      onChange={(e) => setRadius(Number(e.target.value))}
+                      style={{ flex: 1, accentColor: "var(--emerald-primary)", cursor: "pointer" }}
+                    />
+                    <input
+                      type="number"
+                      min="10"
+                      max="100000"
+                      value={radius}
+                      onChange={(e) => setRadius(Number(e.target.value))}
+                      style={{
+                        width: "80px",
+                        padding: "6px 8px",
+                        borderRadius: "6px",
+                        border: "1px solid var(--border-light)",
+                        fontSize: "12px",
+                        backgroundColor: "#ffffff",
+                        textAlign: "right"
+                      }}
+                    />
+                    <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>meters</span>
+                  </div>
+                </div>
+              </>
+            ) : (
+              /* WAYPOINT POLYGON MODE INPUTS */
+              <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                {/* Interactive Drawing Launcher Button */}
+                <div style={{
+                  padding: "12px",
+                  borderRadius: "8px",
+                  backgroundColor: "var(--bg-green-tint)",
+                  border: "1px solid #a7f3d0",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between"
+                }}>
+                  <div>
+                    <div style={{ fontSize: "12px", fontWeight: 800, color: "var(--emerald-dark)", display: "flex", alignItems: "center", gap: "6px" }}>
+                      <PenTool size={14} />
+                      <span>Interactive Live Map Marker</span>
+                    </div>
+                    <p style={{ fontSize: "11px", color: "var(--emerald-dark)", marginTop: "2px" }}>
+                      Click points directly on the Leaflet map to draw your enclosed waypoint region.
+                    </p>
+                  </div>
+                  {onStartMapDrawing && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onClose();
+                        onStartMapDrawing();
+                      }}
+                      style={{
+                        padding: "7px 12px",
+                        borderRadius: "6px",
+                        border: "none",
+                        backgroundColor: "var(--emerald-primary)",
+                        color: "#ffffff",
+                        fontWeight: 700,
+                        fontSize: "11px",
+                        cursor: "pointer",
+                        boxShadow: "0 2px 8px rgba(5, 150, 105, 0.25)"
+                      }}
+                    >
+                      📍 Start Drawing on Map
+                    </button>
+                  )}
+                </div>
+
+                {/* Waypoint Coordinates List Header */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <label style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-secondary)" }}>
+                    Waypoints ({waypoints.length} points)
+                  </label>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <button
+                      type="button"
+                      onClick={handleAddWaypoint}
+                      style={{
+                        fontSize: "11px",
+                        fontWeight: 700,
+                        padding: "4px 8px",
+                        borderRadius: "6px",
+                        backgroundColor: "#ffffff",
+                        border: "1px solid var(--border-light)",
+                        color: "var(--emerald-primary)",
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "4px"
+                      }}
+                    >
+                      <Plus size={12} />
+                      <span>Add Point</span>
+                    </button>
+                    {waypoints.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setWaypoints([]);
+                          if (onClearDrawnWaypoints) onClearDrawnWaypoints();
+                        }}
+                        style={{
+                          fontSize: "11px",
+                          fontWeight: 600,
+                          padding: "4px 8px",
+                          borderRadius: "6px",
+                          backgroundColor: "#ffffff",
+                          border: "1px solid var(--border-light)",
+                          color: "#ef4444",
+                          cursor: "pointer"
+                        }}
+                      >
+                        Clear All
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Waypoint Entries */}
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "160px", overflowY: "auto" }}>
+                  {waypoints.map((wp, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        backgroundColor: "#ffffff",
+                        padding: "6px 10px",
+                        borderRadius: "6px",
+                        border: "1px solid var(--border-light)"
+                      }}
+                    >
+                      <span style={{
+                        fontSize: "10px",
+                        fontWeight: 800,
+                        backgroundColor: "var(--bg-green-tint)",
+                        color: "var(--emerald-dark)",
+                        padding: "2px 6px",
+                        borderRadius: "4px"
+                      }}>
+                        W{idx + 1}
+                      </span>
+                      <input
+                        type="number"
+                        step="0.000001"
+                        value={wp[0]}
+                        onChange={(e) => handleUpdateWaypoint(idx, parseFloat(e.target.value) || 0, wp[1])}
+                        placeholder="Latitude"
+                        style={{
+                          flex: 1,
+                          padding: "4px 8px",
+                          fontSize: "11px",
+                          fontFamily: "'JetBrains Mono', monospace",
+                          border: "1px solid var(--border-light)",
+                          borderRadius: "4px"
+                        }}
+                      />
+                      <input
+                        type="number"
+                        step="0.000001"
+                        value={wp[1]}
+                        onChange={(e) => handleUpdateWaypoint(idx, wp[0], parseFloat(e.target.value) || 0)}
+                        placeholder="Longitude"
+                        style={{
+                          flex: 1,
+                          padding: "4px 8px",
+                          fontSize: "11px",
+                          fontFamily: "'JetBrains Mono', monospace",
+                          border: "1px solid var(--border-light)",
+                          borderRadius: "4px"
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveWaypoint(idx)}
+                        style={{
+                          background: "none",
+                          border: "none",
+                          color: "#94a3b8",
+                          cursor: "pointer",
+                          padding: "2px"
+                        }}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+
+                  {waypoints.length === 0 && (
+                    <div style={{
+                      textAlign: "center",
+                      padding: "16px",
+                      border: "1px dashed var(--border-light)",
+                      borderRadius: "6px",
+                      color: "var(--text-muted)",
+                      fontSize: "11px"
+                    }}>
+                      No waypoints placed. Click <b>"Start Drawing on Map"</b> or <b>"Add Point"</b> to define perimeter coordinates.
+                    </div>
+                  )}
+                </div>
+
+                {/* Waypoint Region Metrics Summary */}
+                {waypoints.length >= 3 && (
+                  <div style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr",
+                    gap: "8px",
+                    backgroundColor: "#ffffff",
+                    padding: "10px",
                     borderRadius: "6px",
                     border: "1px solid var(--border-light)",
-                    fontSize: "13px",
-                    fontFamily: "'JetBrains Mono', monospace",
-                    backgroundColor: "#ffffff",
-                    outline: "none"
-                  }}
-                />
+                    fontSize: "11px"
+                  }}>
+                    <div>
+                      <span style={{ color: "var(--text-secondary)", display: "block" }}>Enclosed Perimeter</span>
+                      <span style={{ fontWeight: 800, color: "var(--emerald-dark)", fontSize: "12px" }}>
+                        {formatDistance(calculatePolygonPerimeterMeters(waypoints))}
+                      </span>
+                    </div>
+                    <div>
+                      <span style={{ color: "var(--text-secondary)", display: "block" }}>Approx. Land Area</span>
+                      <span style={{ fontWeight: 800, color: "var(--emerald-primary)", fontSize: "12px" }}>
+                        {formatArea(calculatePolygonAreaMeters(waypoints))}
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
-
-              <div>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)", display: "block", marginBottom: "4px" }}>
-                  Center Longitude (decimal °)
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. 73.856743"
-                  value={lon}
-                  onChange={(e) => setLon(e.target.value)}
-                  style={{
-                    width: "100%",
-                    padding: "9px 12px",
-                    borderRadius: "6px",
-                    border: "1px solid var(--border-light)",
-                    fontSize: "13px",
-                    fontFamily: "'JetBrains Mono', monospace",
-                    backgroundColor: "#ffffff",
-                    outline: "none"
-                  }}
-                />
-              </div>
-            </div>
-
-            {/* Coordinate Fill Shortcuts */}
-            <div style={{ display: "flex", gap: "8px" }}>
-              <button
-                type="button"
-                onClick={handleUseMapCenter}
-                style={{
-                  fontSize: "11px",
-                  fontWeight: 600,
-                  padding: "5px 10px",
-                  borderRadius: "6px",
-                  backgroundColor: "#ffffff",
-                  border: "1px solid var(--border-light)",
-                  color: "var(--text-secondary)",
-                  cursor: "pointer"
-                }}
-              >
-                📍 Use Map Center
-              </button>
-
-              <button
-                type="button"
-                onClick={handleUseDeviceLocation}
-                disabled={devices.length === 0}
-                style={{
-                  fontSize: "11px",
-                  fontWeight: 600,
-                  padding: "5px 10px",
-                  borderRadius: "6px",
-                  backgroundColor: "#ffffff",
-                  border: "1px solid var(--border-light)",
-                  color: devices.length > 0 ? "var(--emerald-primary)" : "var(--text-muted)",
-                  cursor: devices.length > 0 ? "pointer" : "not-allowed"
-                }}
-              >
-                🎯 Use Device Position
-              </button>
-            </div>
-
-            {/* Radius Slider & Input */}
-            <div>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-secondary)" }}>
-                  Zone Radius: <span style={{ color: "var(--emerald-primary)", fontWeight: 800 }}>{formatDistance(radius)}</span>
-                </label>
-                <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>50m to 10,000m</span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                <input
-                  type="range"
-                  min="50"
-                  max="5000"
-                  step="50"
-                  value={radius}
-                  onChange={(e) => setRadius(Number(e.target.value))}
-                  style={{ flex: 1, accentColor: "var(--emerald-primary)", cursor: "pointer" }}
-                />
-                <input
-                  type="number"
-                  min="10"
-                  max="100000"
-                  value={radius}
-                  onChange={(e) => setRadius(Number(e.target.value))}
-                  style={{
-                    width: "80px",
-                    padding: "6px 8px",
-                    borderRadius: "6px",
-                    border: "1px solid var(--border-light)",
-                    fontSize: "12px",
-                    backgroundColor: "#ffffff",
-                    textAlign: "right"
-                  }}
-                />
-                <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>meters</span>
-              </div>
-            </div>
+            )}
 
             {/* Color Palette Selection */}
             <div>
@@ -520,6 +865,7 @@ export default function GeofenceModal({
             {/* Submit Button */}
             <button
               type="submit"
+              disabled={fenceType === "polygon" && waypoints.length < 3}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -527,18 +873,18 @@ export default function GeofenceModal({
                 gap: "8px",
                 padding: "10px 16px",
                 borderRadius: "8px",
-                backgroundColor: "var(--emerald-primary)",
+                backgroundColor: fenceType === "polygon" && waypoints.length < 3 ? "#94a3b8" : "var(--emerald-primary)",
                 border: "none",
                 color: "#ffffff",
                 fontSize: "13px",
                 fontWeight: 700,
-                cursor: "pointer",
+                cursor: fenceType === "polygon" && waypoints.length < 3 ? "not-allowed" : "pointer",
                 boxShadow: "0 4px 12px rgba(5, 150, 105, 0.25)",
                 marginTop: "6px"
               }}
             >
               <Plus size={16} />
-              <span>Add Geofence to Map</span>
+              <span>{fenceType === "polygon" ? `Save Waypoint Geofence (${waypoints.length} points)` : "Add Circular Geofence to Map"}</span>
             </button>
           </form>
 

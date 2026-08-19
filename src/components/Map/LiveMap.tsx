@@ -3,7 +3,7 @@
 import React, { useEffect, useRef } from "react";
 import { DeviceTelemetry, GeofenceZone } from "@/lib/types";
 import { Maximize2, ShieldCheck, MapPin } from "lucide-react";
-import { formatDistance } from "@/lib/geo";
+import { calculatePolygonPerimeterMeters, formatDistance } from "@/lib/geo";
 
 interface LiveMapProps {
   devices: DeviceTelemetry[];
@@ -14,6 +14,10 @@ interface LiveMapProps {
   focusCoords?: [number, number] | null;
   onMapClickCoords?: (lat: number, lon: number) => void;
   serverOrigin?: [number, number] | null;
+  isDrawingWaypoints?: boolean;
+  drawingWaypoints?: [number, number][];
+  onAddDrawingWaypoint?: (coords: [number, number]) => void;
+  drawingColor?: string;
 }
 
 export default function LiveMap({
@@ -24,7 +28,11 @@ export default function LiveMap({
   geofences = [],
   focusCoords,
   onMapClickCoords,
-  serverOrigin
+  serverOrigin,
+  isDrawingWaypoints = false,
+  drawingWaypoints = [],
+  onAddDrawingWaypoint,
+  drawingColor = "#059669"
 }: LiveMapProps) {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
@@ -32,6 +40,7 @@ export default function LiveMap({
   const circlesRef = useRef<Record<string, any>>({});
   const polylinesRef = useRef<Record<string, any>>({});
   const geofenceLayersRef = useRef<any[]>([]);
+  const drawingLayersRef = useRef<any[]>([]);
   const userInteractedRef = useRef<boolean>(false);
   const initialCenterSetRef = useRef<boolean>(false);
   const [mapStyle, setMapStyle] = React.useState<"light" | "osm" | "satellite">("light");
@@ -79,7 +88,9 @@ export default function LiveMap({
       });
 
       map.on("click", (e: any) => {
-        if (onMapClickCoords) {
+        if (onAddDrawingWaypoint && isDrawingWaypoints) {
+          onAddDrawingWaypoint([e.latlng.lat, e.latlng.lng]);
+        } else if (onMapClickCoords) {
           onMapClickCoords(e.latlng.lat, e.latlng.lng);
         }
       });
@@ -95,7 +106,7 @@ export default function LiveMap({
         mapRef.current = null;
       }
     };
-  }, []);
+  }, [isDrawingWaypoints, onAddDrawingWaypoint, onMapClickCoords]);
 
   // Change tile provider
   useEffect(() => {
@@ -313,7 +324,7 @@ export default function LiveMap({
     });
   }, [devices, activeTrails, onSelectDevice]);
 
-  // Geofences rendering
+  // Geofences rendering (Circles and Multi-Waypoint Polygons)
   useEffect(() => {
     if (!mapRef.current) return;
     import("leaflet").then((L) => {
@@ -324,46 +335,160 @@ export default function LiveMap({
       geofences.forEach((zone) => {
         if (!zone.enabled) return;
 
-        // Render Geofence Radius Circle
-        const circle = L.circle(zone.center, {
-          radius: zone.radiusMeters,
-          color: zone.color || "#059669",
-          weight: 2,
-          dashArray: "6, 6",
-          fillColor: zone.color || "#10b981",
-          fillOpacity: 0.12
-        }).addTo(map);
+        const isPolygon = zone.type === "polygon" && zone.waypoints && zone.waypoints.length >= 3;
 
-        // Center Pin Marker
-        const centerIcon = L.divIcon({
-          html: `
-            <div style="
-              width: 10px;
-              height: 10px;
-              border-radius: 50%;
-              background: ${zone.color};
-              border: 2px solid #ffffff;
-              box-shadow: 0 1px 4px rgba(0,0,0,0.3);
-            "></div>
-          `,
-          className: "geofence-center-pin",
-          iconSize: [10, 10],
-          iconAnchor: [5, 5]
-        });
-        const centerMarker = L.marker(zone.center, { icon: centerIcon }).addTo(map);
+        if (isPolygon && zone.waypoints) {
+          // Render Waypoint Enclosed Polygon
+          const polygon = L.polygon(zone.waypoints, {
+            color: zone.color || "#059669",
+            weight: 2.5,
+            dashArray: "6, 6",
+            fillColor: zone.color || "#10b981",
+            fillOpacity: 0.16
+          }).addTo(map);
 
-        circle.bindTooltip(`
-          <div style="padding: 2px 4px;">
-            <b>${zone.name}</b><br/>
-            Radius: ${formatDistance(zone.radiusMeters)}<br/>
-            Center: ${zone.center[0].toFixed(5)}, ${zone.center[1].toFixed(5)}
-          </div>
-        `, { permanent: false, direction: "top" });
+          // Add waypoint vertex pins
+          zone.waypoints.forEach((wp, idx) => {
+            const wpIcon = L.divIcon({
+              html: `
+                <div style="
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                  width: 18px;
+                  height: 18px;
+                  border-radius: 50%;
+                  background: #ffffff;
+                  border: 2px solid ${zone.color};
+                  color: ${zone.color};
+                  font-size: 9px;
+                  font-weight: 800;
+                  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+                ">
+                  ${idx + 1}
+                </div>
+              `,
+              className: "waypoint-vertex-pin",
+              iconSize: [18, 18],
+              iconAnchor: [9, 9]
+            });
+            const wpMarker = L.marker(wp, { icon: wpIcon }).addTo(map);
+            geofenceLayersRef.current.push(wpMarker);
+          });
 
-        geofenceLayersRef.current.push(circle, centerMarker);
+          const perimeter = calculatePolygonPerimeterMeters(zone.waypoints);
+          polygon.bindTooltip(`
+            <div style="padding: 4px 6px;">
+              <b style="color: ${zone.color}">${zone.name}</b> (Waypoint Region)<br/>
+              <b>Waypoints:</b> ${zone.waypoints.length} points<br/>
+              <b>Perimeter:</b> ${formatDistance(perimeter)}
+            </div>
+          `, { permanent: false, direction: "top" });
+
+          geofenceLayersRef.current.push(polygon);
+        } else {
+          // Render Geofence Radius Circle
+          const circle = L.circle(zone.center, {
+            radius: zone.radiusMeters,
+            color: zone.color || "#059669",
+            weight: 2,
+            dashArray: "6, 6",
+            fillColor: zone.color || "#10b981",
+            fillOpacity: 0.14
+          }).addTo(map);
+
+          // Center Pin Marker
+          const centerIcon = L.divIcon({
+            html: `
+              <div style="
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                background: ${zone.color};
+                border: 2px solid #ffffff;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+              "></div>
+            `,
+            className: "geofence-center-pin",
+            iconSize: [10, 10],
+            iconAnchor: [5, 5]
+          });
+          const centerMarker = L.marker(zone.center, { icon: centerIcon }).addTo(map);
+
+          circle.bindTooltip(`
+            <div style="padding: 2px 4px;">
+              <b>${zone.name}</b> (Circular Fence)<br/>
+              Radius: ${formatDistance(zone.radiusMeters)}<br/>
+              Center: ${zone.center[0].toFixed(5)}, ${zone.center[1].toFixed(5)}
+            </div>
+          `, { permanent: false, direction: "top" });
+
+          geofenceLayersRef.current.push(circle, centerMarker);
+        }
       });
     });
   }, [geofences]);
+
+  // Live Interactive In-Progress Waypoint Drawing Layer
+  useEffect(() => {
+    if (!mapRef.current) return;
+    import("leaflet").then((L) => {
+      const map = mapRef.current;
+      drawingLayersRef.current.forEach((layer) => map.removeLayer(layer));
+      drawingLayersRef.current = [];
+
+      if (!isDrawingWaypoints || drawingWaypoints.length === 0) return;
+
+      // 1. Draw connecting polyline or enclosed polygon preview
+      if (drawingWaypoints.length >= 3) {
+        const previewPoly = L.polygon(drawingWaypoints, {
+          color: drawingColor,
+          weight: 2.5,
+          dashArray: "4, 4",
+          fillColor: drawingColor,
+          fillOpacity: 0.2
+        }).addTo(map);
+        drawingLayersRef.current.push(previewPoly);
+      } else if (drawingWaypoints.length === 2) {
+        const previewLine = L.polyline(drawingWaypoints, {
+          color: drawingColor,
+          weight: 2.5,
+          dashArray: "4, 4"
+        }).addTo(map);
+        drawingLayersRef.current.push(previewLine);
+      }
+
+      // 2. Draw numbered interactive waypoint pins
+      drawingWaypoints.forEach((wp, idx) => {
+        const pinIcon = L.divIcon({
+          html: `
+            <div style="
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              width: 24px;
+              height: 24px;
+              border-radius: 50%;
+              background: ${drawingColor};
+              color: #ffffff;
+              font-size: 11px;
+              font-weight: 800;
+              border: 2.5px solid #ffffff;
+              box-shadow: 0 3px 8px rgba(0,0,0,0.35);
+              transform: scale(1.1);
+            ">
+              W${idx + 1}
+            </div>
+          `,
+          className: "drawing-waypoint-pin",
+          iconSize: [24, 24],
+          iconAnchor: [12, 12]
+        });
+        const marker = L.marker(wp, { icon: pinIcon }).addTo(map);
+        drawingLayersRef.current.push(marker);
+      });
+    });
+  }, [isDrawingWaypoints, drawingWaypoints, drawingColor]);
 
   const fitAllDevices = () => {
     if (!mapRef.current) return;
@@ -382,7 +507,50 @@ export default function LiveMap({
   return (
     <div style={{ position: "relative", width: "100%", height: "100%", minHeight: "500px" }}>
       {/* Map Target Container */}
-      <div ref={mapContainerRef} style={{ width: "100%", height: "100%", zIndex: 1 }} />
+      <div
+        ref={mapContainerRef}
+        style={{
+          width: "100%",
+          height: "100%",
+          zIndex: 1,
+          cursor: isDrawingWaypoints ? "crosshair" : "grab"
+        }}
+      />
+
+      {/* Floating Waypoint Drawing Mode Banner */}
+      {isDrawingWaypoints && (
+        <div style={{
+          position: "absolute",
+          top: "16px",
+          left: "50%",
+          transform: "translateX(-50%)",
+          zIndex: 1000,
+          backgroundColor: "#ffffff",
+          border: `2px solid ${drawingColor}`,
+          borderRadius: "var(--radius-md)",
+          padding: "10px 18px",
+          boxShadow: "0 8px 24px rgba(0, 0, 0, 0.15)",
+          display: "flex",
+          alignItems: "center",
+          gap: "12px",
+          animation: "fadeIn 0.2s ease"
+        }}>
+          <div style={{
+            width: "10px",
+            height: "10px",
+            borderRadius: "50%",
+            backgroundColor: drawingColor
+          }} className="pulse-active" />
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            <span style={{ fontSize: "12px", fontWeight: 800, color: "var(--emerald-dark)" }}>
+              📍 Waypoint Geofence Marking Active
+            </span>
+            <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+              Click on map to drop waypoint vertices ({drawingWaypoints.length} placed · {drawingWaypoints.length < 3 ? `Need ${3 - drawingWaypoints.length} more` : "Perimeter enclosed"})
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Floating Map Controls & Overlays */}
       <div style={{
