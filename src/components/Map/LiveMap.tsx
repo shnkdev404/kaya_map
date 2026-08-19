@@ -46,15 +46,28 @@ export default function LiveMap({
   const [mapStyle, setMapStyle] = React.useState<"light" | "osm" | "satellite">("light");
   const tileLayerRef = useRef<any>(null);
 
-  // Initialize Leaflet map
+  // Callback Refs to keep single-mount map stable without blinking/re-rendering loops
+  const isDrawingWaypointsRef = useRef(isDrawingWaypoints);
+  const onAddDrawingWaypointRef = useRef(onAddDrawingWaypoint);
+  const onMapClickCoordsRef = useRef(onMapClickCoords);
+  const onSelectDeviceRef = useRef(onSelectDevice);
+
+  useEffect(() => { isDrawingWaypointsRef.current = isDrawingWaypoints; }, [isDrawingWaypoints]);
+  useEffect(() => { onAddDrawingWaypointRef.current = onAddDrawingWaypoint; }, [onAddDrawingWaypoint]);
+  useEffect(() => { onMapClickCoordsRef.current = onMapClickCoords; }, [onMapClickCoords]);
+  useEffect(() => { onSelectDeviceRef.current = onSelectDevice; }, [onSelectDevice]);
+
+  // Initialize Leaflet map (Runs ONCE on mount)
   useEffect(() => {
     if (typeof window === "undefined" || !mapContainerRef.current) return;
 
     let L: any;
+    let isCancelled = false;
+
     const init = async () => {
       L = await import("leaflet");
 
-      if (mapRef.current) return;
+      if (isCancelled || mapRef.current) return;
 
       const initCenter: [number, number] = serverOrigin || (devices.length > 0 ? [devices[0].lat, devices[0].lon] : [20.5937, 78.9629]);
       const initZoom = serverOrigin || devices.length > 0 ? 16 : 4;
@@ -88,10 +101,10 @@ export default function LiveMap({
       });
 
       map.on("click", (e: any) => {
-        if (onAddDrawingWaypoint && isDrawingWaypoints) {
-          onAddDrawingWaypoint([e.latlng.lat, e.latlng.lng]);
-        } else if (onMapClickCoords) {
-          onMapClickCoords(e.latlng.lat, e.latlng.lng);
+        if (isDrawingWaypointsRef.current && onAddDrawingWaypointRef.current) {
+          onAddDrawingWaypointRef.current([e.latlng.lat, e.latlng.lng]);
+        } else if (onMapClickCoordsRef.current) {
+          onMapClickCoordsRef.current(e.latlng.lat, e.latlng.lng);
         }
       });
 
@@ -101,12 +114,15 @@ export default function LiveMap({
     init();
 
     return () => {
+      isCancelled = true;
       if (mapRef.current) {
-        mapRef.current.remove();
+        try {
+          mapRef.current.remove();
+        } catch (e) {}
         mapRef.current = null;
       }
     };
-  }, [isDrawingWaypoints, onAddDrawingWaypoint, onMapClickCoords]);
+  }, []);
 
   // Change tile provider
   useEffect(() => {
@@ -272,7 +288,9 @@ export default function LiveMap({
         if (!markersRef.current[device.device_id]) {
           const marker = L.marker(pos, { icon: customIcon }).addTo(map);
           marker.on("click", () => {
-            onSelectDevice(device);
+            if (onSelectDeviceRef.current) {
+              onSelectDeviceRef.current(device);
+            }
           });
           markersRef.current[device.device_id] = marker;
         } else {
@@ -322,7 +340,7 @@ export default function LiveMap({
         map.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 });
       }
     });
-  }, [devices, activeTrails, onSelectDevice]);
+  }, [devices, activeTrails]);
 
   // Geofences rendering (Circles and Multi-Waypoint Polygons)
   useEffect(() => {
