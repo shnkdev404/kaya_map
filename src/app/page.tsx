@@ -113,6 +113,7 @@ export default function DashboardPage() {
   const [isCalibrateModalOpen, setIsCalibrateModalOpen] = useState(false);
   const [isPinpointingStation, setIsPinpointingStation] = useState(false);
   const isCustomStationCalibratedRef = useRef(false);
+  const hasAutoSyncedPhoneRef = useRef(false);
   const laptopWatchIdRef = useRef<number | null>(null);
   const initialOriginSetRef = useRef(false);
 
@@ -287,6 +288,13 @@ export default function DashboardPage() {
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === "snapshot" && Array.isArray(msg.devices)) {
+              // Auto-sync laptop base station to phone satellite GPS if not custom calibrated
+              const phone = msg.devices.find((x: any) => (x.type === "phone" || x.device_id.startsWith("phone") || x.device_id === "phone-broadcaster") && (x.accuracy_m || 20) <= 15);
+              if (phone && !isCustomStationCalibratedRef.current && !hasAutoSyncedPhoneRef.current) {
+                hasAutoSyncedPhoneRef.current = true;
+                syncServerStation(phone.lat, phone.lon, Math.min(phone.accuracy_m || 2, 2.5), phone.altitude_m || null, "Auto-Synced from Phone GNSS");
+              }
+
               setDevices((prev) => {
                 const prevMap = new Map(prev.map((d) => [d.device_id, d]));
                 const merged: DeviceTelemetry[] = msg.devices.map((rawDev: DeviceTelemetry) => {
@@ -307,6 +315,13 @@ export default function DashboardPage() {
               });
             } else if (msg.type === "update" && msg.device) {
               const d = applyDeviceKalman(msg.device as DeviceTelemetry);
+
+              // Auto-sync laptop base station to phone satellite GPS on first connection if not custom calibrated
+              if (!isCustomStationCalibratedRef.current && !hasAutoSyncedPhoneRef.current && (d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster") && (d.accuracy_m || 20) <= 15) {
+                hasAutoSyncedPhoneRef.current = true;
+                syncServerStation(d.lat, d.lon, Math.min(d.accuracy_m || 2, 2.5), d.altitude_m || null, "Auto-Synced from Phone GNSS");
+              }
+
               setDevices((prev) => {
                 const map = new Map(prev.map((dev) => [dev.device_id, dev]));
                 const existing = map.get(d.device_id);
