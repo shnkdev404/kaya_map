@@ -2,7 +2,9 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
-import Sidebar from "@/components/Sidebar";
+import Navbar from "@/components/Navigation/Navbar";
+import StatsHeader from "@/components/Dashboard/StatsHeader";
+import DeviceCard from "@/components/Dashboard/DeviceCard";
 import SimulatorModal from "@/components/Dashboard/SimulatorModal";
 import GeofenceModal from "@/components/Dashboard/GeofenceModal";
 import StationCalibrateModal from "@/components/Dashboard/StationCalibrateModal";
@@ -47,13 +49,7 @@ import {
   Hexagon,
   Circle,
   Crosshair,
-  Satellite,
-  Wifi,
-  Shield,
-  SlidersHorizontal,
-  Navigation,
-  Cpu,
-  Maximize2
+  Satellite
 } from "lucide-react";
 import Link from "next/link";
 
@@ -87,8 +83,8 @@ const LiveMap = dynamic(() => import("@/components/Map/LiveMap"), {
   )
 });
 
-export default function GeofenceDashboardPage() {
-  // Real-time fleet devices
+export default function DashboardPage() {
+  // Start with 0 dummy devices
   const [devices, setDevices] = useState<DeviceTelemetry[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<DeviceTelemetry | null>(null);
   const [activeTrails, setActiveTrails] = useState<Record<string, boolean>>({});
@@ -104,7 +100,7 @@ export default function GeofenceDashboardPage() {
   const [geofenceAlerts, setGeofenceAlerts] = useState<GeofenceAlert[]>([]);
   const previousContainmentRef = useRef<Record<string, Record<string, boolean>>>({});
 
-  // Simulator State
+  // Simulator State (Empty & Off by default)
   const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
   const [isSimulating, setIsSimulating] = useState(false);
   const [simProfiles, setSimProfiles] = useState<SimulationProfile[]>([]);
@@ -135,7 +131,9 @@ export default function GeofenceDashboardPage() {
     }
     const kf = kalmanFiltersMapRef.current.get(d.device_id)!;
     const kState = kf.update(d.lat, d.lon, d.accuracy_m || 5, d.timestamp || Date.now() / 1000, d.altitude_m || 0);
-    const finalSpeed = (d.speed_mps !== undefined && d.speed_mps !== null && d.speed_mps > 0) ? d.speed_mps : kState.speedMps;
+    const finalSpeed = (d.type === "station" || d.device_id === "station-laptop") 
+      ? 0.0 
+      : (d.speed_mps !== undefined && d.speed_mps !== null && d.speed_mps > 0) ? d.speed_mps : kState.speedMps;
 
     return {
       ...d,
@@ -167,7 +165,7 @@ export default function GeofenceDashboardPage() {
       lat,
       lon,
       accuracy_m: kState.accuracy,
-      speed_mps: kState.speedMps,
+      speed_mps: 0.0,
       altitude_m: kState.alt,
       timestamp: Date.now() / 1000,
       online: true,
@@ -366,19 +364,71 @@ export default function GeofenceDashboardPage() {
     };
   }, [isLaptopStationActive]);
 
-  // Fast Fallback Polling (every 350ms)
+  // 2. FastAPI WebSocket Client fallback (if server.py is running on port 8000)
   useEffect(() => {
-    let timer: any = null;
+    let ws: WebSocket | null = null;
+    let reconnectTimeout: any = null;
 
-    const poll = async () => {
+    const connectWebSocket = () => {
+      if (typeof window === "undefined") return;
       try {
-        const res = await fetch("/api/telemetry");
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data)) {
+        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const host = window.location.hostname;
+        const port = "8000";
+        const url = `${proto}//${host}:${port}/ws/viewer`;
+
+        ws = new WebSocket(url);
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === "snapshot" && Array.isArray(data.devices)) {
+              setDevices((prev) => {
+                const map = new Map(prev.map((d) => [d.device_id, d]));
+                data.devices.forEach((d: DeviceTelemetry) => {
+                  const existing = map.get(d.device_id);
+                  const history = existing ? [...(existing.history || []), { lat: d.lat, lon: d.lon, timestamp: Date.now() / 1000 }] : [{ lat: d.lat, lon: d.lon, timestamp: Date.now() / 1000 }];
+                  map.set(d.device_id, { ...d, history: history.slice(-50) });
+                });
+                return Array.from(map.values());
+              });
+            } else if (data.type === "update" && data.device) {
+              const d = data.device;
+              setDevices((prev) => {
+                const map = new Map(prev.map((dev) => [dev.device_id, dev]));
+                const existing = map.get(d.device_id);
+                const history = existing ? [...(existing.history || []), { lat: d.lat, lon: d.lon, timestamp: Date.now() / 1000 }] : [{ lat: d.lat, lon: d.lon, timestamp: Date.now() / 1000 }];
+                map.set(d.device_id, { ...d, history: history.slice(-50) });
+                return Array.from(map.values());
+              });
+            }
+          } catch (err) {}
+        };
+
+        ws.onclose = () => {
+          reconnectTimeout = setTimeout(connectWebSocket, 5000);
+        };
+      } catch (e) {}
+    };
+
+    connectWebSocket();
+
+    return () => {
+      if (ws) ws.close();
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    };
+  }, []);
+
+  // 3. Fast HTTP API Poll Fallback (every 350ms for low-latency synchronization)
+  useEffect(() => {
+    const pollInterval = setInterval(() => {
+      fetch("/api/telemetry")
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.status === "ok" && Array.isArray(data.devices)) {
             setDevices((prev) => {
               const prevMap = new Map(prev.map((d) => [d.device_id, d]));
-              const merged: DeviceTelemetry[] = data.map((rawDev: DeviceTelemetry) => {
+              const serverDevices: DeviceTelemetry[] = data.devices.map((rawDev: DeviceTelemetry) => {
                 const d = applyDeviceKalman(rawDev);
                 const existing = prevMap.get(d.device_id);
                 const prevHist = existing?.history || [];
@@ -388,61 +438,75 @@ export default function GeofenceDashboardPage() {
                 return { ...d, history };
               });
 
-              if (isLaptopStationActive && !data.some((d: any) => d.device_id === "station-laptop")) {
+              // Keep local station-laptop if active locally and not on server yet
+              if (isLaptopStationActive && !data.devices.some((d: any) => d.device_id === "station-laptop")) {
                 const localStation = prev.find((p) => p.device_id === "station-laptop");
-                if (localStation) merged.unshift(localStation);
+                if (localStation) serverDevices.unshift(localStation);
               }
-              return merged;
+
+              // Keep simulated targets if simulating
+              if (isSimulating) {
+                const simDevices = prev.filter((d) => d.device_id.startsWith("sim-"));
+                simDevices.forEach((sd) => {
+                  if (!serverDevices.some((ud) => ud.device_id === sd.device_id)) {
+                    serverDevices.push(sd);
+                  }
+                });
+              }
+
+              return serverDevices;
             });
           }
-        }
-      } catch (err) {}
-      timer = setTimeout(poll, 350);
-    };
+        })
+        .catch(() => {});
+    }, 350);
 
-    poll();
-    return () => clearTimeout(timer);
-  }, [isLaptopStationActive]);
+    return () => clearInterval(pollInterval);
+  }, [isLaptopStationActive, isSimulating]);
 
-  // Geofencing Containment & Breach Detection
+  // Geofence Containment & Breach Detection Engine
   useEffect(() => {
-    const activeZones = geofences.filter((g) => g.enabled);
-    if (activeZones.length === 0 || devices.length === 0) return;
+    if (geofences.length === 0 || devices.length === 0) return;
 
     devices.forEach((device) => {
-      if (device.type === "station") return;
+      geofences.forEach((zone) => {
+        if (!zone.enabled) return;
 
-      activeZones.forEach((zone) => {
+        const isPoly = zone.type === "polygon" && zone.waypoints && zone.waypoints.length >= 3;
         let isInside = false;
-        let dist = 0;
+        let distance = 0;
 
-        if (zone.type === "polygon" && zone.waypoints && zone.waypoints.length >= 3) {
+        if (isPoly && zone.waypoints) {
           isInside = isPointInPolygon([device.lat, device.lon], zone.waypoints);
-          dist = calculateDistanceMeters(device.lat, device.lon, zone.center[0], zone.center[1]);
+          distance = calculateDistanceMeters(device.lat, device.lon, zone.center[0], zone.center[1]);
         } else {
-          dist = calculateDistanceMeters(device.lat, device.lon, zone.center[0], zone.center[1]);
-          isInside = dist <= zone.radiusMeters;
+          distance = calculateDistanceMeters(device.lat, device.lon, zone.center[0], zone.center[1]);
+          isInside = distance <= zone.radiusMeters;
         }
 
-        const devMap = previousContainmentRef.current[device.device_id] || {};
-        const wasInside = devMap[zone.id];
+        const prevInside = previousContainmentRef.current[device.device_id]?.[zone.id];
 
-        if (wasInside !== undefined && wasInside !== isInside) {
-          const alertType: "entered" | "exited" = isInside ? "entered" : "exited";
-          const newAlert: GeofenceAlert = {
-            id: `alert-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-            deviceId: device.device_id,
-            deviceName: device.name || device.device_id,
-            zoneId: zone.id,
-            zoneName: zone.name,
-            timestamp: Date.now() / 1000,
-            type: alertType,
-            distance: dist
-          };
+        if (prevInside !== undefined && prevInside !== isInside) {
+          const alertType = isInside ? "entered" : "exited";
+          const shouldAlert = (isInside && zone.alertOnEnter) || (!isInside && zone.alertOnExit);
 
-          setGeofenceAlerts((prev) => [newAlert, ...prev].slice(0, 10));
+          if (shouldAlert) {
+            const newAlert: GeofenceAlert = {
+              id: `alert-${Date.now()}-${Math.random()}`,
+              deviceId: device.device_id,
+              deviceName: device.name || device.device_id,
+              zoneId: zone.id,
+              zoneName: zone.name,
+              type: alertType,
+              distance,
+              timestamp: Date.now() / 1000
+            };
+
+            setGeofenceAlerts((prev) => [newAlert, ...prev.slice(0, 4)]);
+          }
         }
 
+        // Store state
         if (!previousContainmentRef.current[device.device_id]) {
           previousContainmentRef.current[device.device_id] = {};
         }
@@ -450,6 +514,171 @@ export default function GeofenceDashboardPage() {
       });
     });
   }, [devices, geofences]);
+
+  // Simulator runner (only when explicitly enabled by user)
+  useEffect(() => {
+    if (!isSimulating || simProfiles.length === 0) return;
+
+    const interval = setInterval(() => {
+      setDevices((prevDevices) => {
+        const updated = [...prevDevices];
+
+        simProfiles.forEach((profile) => {
+          let angle = simAnglesRef.current[profile.id] || 0;
+          angle += 0.05;
+          simAnglesRef.current[profile.id] = angle;
+
+          let lat = profile.startLat;
+          let lon = profile.startLon;
+
+          if (profile.pattern === "circle") {
+            const radius = 0.0035;
+            lat = profile.startLat + Math.sin(angle) * radius;
+            lon = profile.startLon + Math.cos(angle) * radius * 1.3;
+          } else if (profile.pattern === "patrol") {
+            const size = 0.005;
+            const segment = Math.floor((angle % 4));
+            const progress = (angle % 1);
+            if (segment === 0) {
+              lat = profile.startLat + progress * size;
+              lon = profile.startLon;
+            } else if (segment === 1) {
+              lat = profile.startLat + size;
+              lon = profile.startLon + progress * size * 1.3;
+            } else if (segment === 2) {
+              lat = profile.startLat + size - progress * size;
+              lon = profile.startLon + size * 1.3;
+            } else {
+              lat = profile.startLat;
+              lon = profile.startLon + size * 1.3 - progress * size * 1.3;
+            }
+          } else {
+            lat = profile.startLat + Math.sin(angle * 0.5) * 0.004;
+            lon = profile.startLon + Math.cos(angle * 0.7) * 0.005;
+          }
+
+          const existingIdx = updated.findIndex((d) => d.device_id === profile.id);
+          const speedMps = profile.speedKmh / 3.6;
+          const newPoint = { lat, lon, timestamp: Date.now() / 1000, speed_mps: speedMps };
+
+          if (existingIdx >= 0) {
+            const cur = updated[existingIdx];
+            const history = [...(cur.history || []), newPoint].slice(-60);
+            updated[existingIdx] = {
+              ...cur,
+              lat,
+              lon,
+              speed_mps: speedMps,
+              timestamp: Date.now() / 1000,
+              online: true,
+              history
+            };
+          } else {
+            updated.push({
+              device_id: profile.id,
+              name: profile.name,
+              type: profile.type,
+              lat,
+              lon,
+              accuracy_m: 2.0,
+              speed_mps: speedMps,
+              battery: 92,
+              timestamp: Date.now() / 1000,
+              online: true,
+              color: profile.color,
+              history: [newPoint]
+            });
+          }
+        });
+
+        return updated;
+      });
+    }, 600);
+
+    return () => clearInterval(interval);
+  }, [isSimulating, simProfiles]);
+
+  // Keep selected device synced
+  useEffect(() => {
+    if (selectedDevice) {
+      const live = devices.find((d) => d.device_id === selectedDevice.device_id);
+      if (live) setSelectedDevice(live);
+    } else if (devices.length > 0) {
+      const station = devices.find((d) => d.device_id === "station-laptop");
+      setSelectedDevice(station || devices[0]);
+    }
+  }, [devices, selectedDevice]);
+
+  const handleRefreshServerGps = () => {
+    setIsRefreshingGps(true);
+    if (typeof window !== "undefined" && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const c = pos.coords;
+          syncServerStation(c.latitude, c.longitude, c.accuracy || 5, c.altitude, "Live GPS Fix");
+          setFocusCoords([c.latitude, c.longitude]);
+          setIsRefreshingGps(false);
+        },
+        (err) => {
+          console.warn("GPS refresh failed:", err);
+          setIsRefreshingGps(false);
+        },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+      );
+    } else {
+      setIsRefreshingGps(false);
+    }
+  };
+
+  const handleToggleLaptopStation = () => {
+    if (isLaptopStationActive) {
+      setIsLaptopStationActive(false);
+      if (laptopWatchIdRef.current !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(laptopWatchIdRef.current);
+        laptopWatchIdRef.current = null;
+      }
+      handleRemoveDevice("station-laptop");
+    } else {
+      setIsLaptopStationActive(true);
+      if (typeof window !== "undefined" && navigator.geolocation) {
+        const watchId = navigator.geolocation.watchPosition(
+          (pos) => {
+            const c = pos.coords;
+            syncServerStation(c.latitude, c.longitude, c.accuracy || 5, c.altitude, "Live GPS Fix");
+          },
+          (err) => {
+            if (laptopLocation) {
+              syncServerStation(laptopLocation.lat, laptopLocation.lon, laptopLocation.accuracy, laptopLocation.altitude);
+            }
+          },
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+        laptopWatchIdRef.current = watchId;
+      } else if (laptopLocation) {
+        syncServerStation(laptopLocation.lat, laptopLocation.lon, laptopLocation.accuracy, laptopLocation.altitude);
+      }
+    }
+  };
+
+  const handleRemoveDevice = async (deviceId: string) => {
+    try {
+      await fetch(`/api/telemetry?device_id=${encodeURIComponent(deviceId)}`, { method: "DELETE" });
+    } catch (e) {}
+
+    setDevices((prev) => prev.filter((d) => d.device_id !== deviceId));
+    if (selectedDevice?.device_id === deviceId) {
+      const remaining = devices.filter((d) => d.device_id !== deviceId);
+      setSelectedDevice(remaining.length > 0 ? remaining[0] : null);
+    }
+  };
+
+  const handleClearAllDevices = async () => {
+    try {
+      await fetch("/api/telemetry?clear=all", { method: "DELETE" });
+    } catch (e) {}
+    setDevices([]);
+    setSelectedDevice(null);
+  };
 
   const handleToggleTrail = (deviceId: string) => {
     setActiveTrails((prev) => ({ ...prev, [deviceId]: !prev[deviceId] }));
@@ -460,243 +689,101 @@ export default function GeofenceDashboardPage() {
     setFocusCoords([device.lat, device.lon]);
   };
 
-  const handleRefreshServerGps = () => {
-    setIsRefreshingGps(true);
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          setIsRefreshingGps(false);
-          const c = pos.coords;
-          syncServerStation(c.latitude, c.longitude, c.accuracy || 5, c.altitude, "Fresh Browser GPS Fix");
-        },
-        () => {
-          setIsRefreshingGps(false);
-        },
-        { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
-      );
-    } else {
-      setIsRefreshingGps(false);
-    }
+  const handleAddGeofence = (zone: GeofenceZone) => {
+    setGeofences((prev) => [...prev, zone]);
+  };
+
+  const handleToggleGeofence = (id: string) => {
+    setGeofences((prev) =>
+      prev.map((g) => (g.id === id ? { ...g, enabled: !g.enabled } : g))
+    );
+  };
+
+  const handleRemoveGeofence = (id: string) => {
+    setGeofences((prev) => prev.filter((g) => g.id !== id));
   };
 
   const filteredDevices = devices.filter((d) => {
-    const matchesSearch = d.device_id.toLowerCase().includes(searchQuery.toLowerCase()) || (d.name && d.name.toLowerCase().includes(searchQuery.toLowerCase()));
+    const matchesSearch = (d.name || d.device_id).toLowerCase().includes(searchQuery.toLowerCase());
     const matchesType = typeFilter === "all" || d.type === typeFilter;
     return matchesSearch && matchesType;
   });
 
-  const totalNodes = devices.length;
-  const streamingNodes = devices.filter((d) => d.online).length;
-  const activeGeofencesCount = geofences.filter((g) => g.enabled).length;
-  const devicesWithAccuracy = devices.filter((d) => d.accuracy_m !== undefined && d.accuracy_m !== null);
-  const avgPrecision = devicesWithAccuracy.length > 0
-    ? Math.round(devicesWithAccuracy.reduce((acc, d) => acc + (d.accuracy_m || 0), 0) / devicesWithAccuracy.length)
-    : 0;
-
-  const currentDevice = selectedDevice || devices.find((d) => d.device_id === "station-laptop") || devices[0];
-  const isServerStation = currentDevice?.device_id === "station-laptop";
+  const onlineCount = devices.filter((d) => d.online).length;
 
   return (
-    <div style={{ display: "flex", height: "100vh", width: "100vw", backgroundColor: "#f8fafc", overflow: "hidden", fontFamily: "'Inter', sans-serif" }}>
-      {/* Unified Left Sidebar */}
-      <Sidebar />
+    <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh", backgroundColor: "var(--bg-main)" }}>
+      {/* Top Navigation */}
+      <Navbar
+        onlineCount={onlineCount}
+        totalDevices={devices.length}
+        onOpenSimulator={() => setIsSimulatorOpen(true)}
+        isSimulating={isSimulating}
+        onOpenGeofences={() => setIsGeofenceModalOpen(true)}
+        geofenceCount={geofences.filter((g) => g.enabled).length}
+        onOpenPhoneGuide={() => setIsPhoneGuideOpen(true)}
+        onToggleLaptopStation={handleToggleLaptopStation}
+        isLaptopStationActive={isLaptopStationActive}
+      />
 
-      {/* Main Content Area */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflowY: "auto", padding: "16px 20px", gap: "16px" }}>
+      {/* Main Container */}
+      <main style={{ flex: 1, padding: "20px 24px", maxWidth: "1680px", margin: "0 auto", width: "100%", display: "flex", flexDirection: "column", gap: "16px" }}>
         
-        {/* TOP ROW: Premium Stat Cards */}
-        <div style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-          gap: "14px",
-          flexShrink: 0
-        }}>
-          {/* Card 1: Fleet Nodes */}
-          <div style={{
-            backgroundColor: "#ffffff",
-            borderRadius: "14px",
-            border: "1px solid var(--border-light)",
-            padding: "16px",
-            boxShadow: "var(--shadow-sm)",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center"
-          }}>
-            <div>
-              <span style={{ fontSize: "10px", fontWeight: 800, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                Fleet Nodes
-              </span>
-              <div style={{ display: "flex", alignItems: "baseline", gap: "6px", marginTop: "4px" }}>
-                <span style={{ fontSize: "26px", fontWeight: 900, color: "#0f172a" }}>{totalNodes}</span>
-                <span style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-muted)" }}>connected</span>
-              </div>
-            </div>
-            <div style={{
-              width: "40px",
-              height: "40px",
-              borderRadius: "10px",
-              backgroundColor: "#f0fdf4",
-              color: "var(--emerald-primary)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              border: "1px solid #d1fae5"
-            }}>
-              <Wifi size={20} />
-            </div>
-          </div>
-
-          {/* Card 2: Live Feeds */}
-          <div style={{
-            backgroundColor: "#ffffff",
-            borderRadius: "14px",
-            border: "1px solid var(--border-light)",
-            padding: "16px",
-            boxShadow: "var(--shadow-sm)",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center"
-          }}>
-            <div>
-              <span style={{ fontSize: "10px", fontWeight: 800, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                Live Stream
-              </span>
-              <div style={{ display: "flex", alignItems: "baseline", gap: "6px", marginTop: "4px" }}>
-                <span style={{ fontSize: "26px", fontWeight: 900, color: "#0f172a" }}>{streamingNodes}</span>
-                <span style={{ fontSize: "11px", fontWeight: 700, color: "var(--emerald-primary)", display: "flex", alignItems: "center", gap: "4px" }}>
-                  <span style={{ width: "6px", height: "6px", borderRadius: "50%", backgroundColor: "var(--emerald-primary)" }} className="pulse-active" />
-                  active
-                </span>
-              </div>
-            </div>
-            <div style={{
-              width: "40px",
-              height: "40px",
-              borderRadius: "10px",
-              backgroundColor: "#f0fdf4",
-              color: "var(--emerald-primary)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              border: "1px solid #d1fae5"
-            }}>
-              <Activity size={20} />
-            </div>
-          </div>
-
-          {/* Card 3: Geofence Zones */}
-          <div style={{
-            backgroundColor: "#ffffff",
-            borderRadius: "14px",
-            border: "1px solid var(--border-light)",
-            padding: "16px",
-            boxShadow: "var(--shadow-sm)",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center"
-          }}>
-            <div>
-              <span style={{ fontSize: "10px", fontWeight: 800, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                Geofence Zones
-              </span>
-              <div style={{ display: "flex", alignItems: "baseline", gap: "6px", marginTop: "4px" }}>
-                <span style={{ fontSize: "26px", fontWeight: 900, color: "#0f172a" }}>{activeGeofencesCount}</span>
-                <span style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-muted)" }}>polygons & circles</span>
-              </div>
-            </div>
-            <div style={{
-              width: "40px",
-              height: "40px",
-              borderRadius: "10px",
-              backgroundColor: "#eff6ff",
-              color: "#2563eb",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              border: "1px solid #bfdbfe"
-            }}>
-              <Shield size={20} />
-            </div>
-          </div>
-
-          {/* Card 4: Avg Precision */}
-          <div style={{
-            backgroundColor: "#ffffff",
-            borderRadius: "14px",
-            border: "1px solid var(--border-light)",
-            padding: "16px",
-            boxShadow: "var(--shadow-sm)",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center"
-          }}>
-            <div>
-              <span style={{ fontSize: "10px", fontWeight: 800, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                GNSS Accuracy
-              </span>
-              <div style={{ display: "flex", alignItems: "baseline", gap: "6px", marginTop: "4px" }}>
-                <span style={{ fontSize: "26px", fontWeight: 900, color: "#0f172a" }}>±{avgPrecision || 2}m</span>
-                <span style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-muted)" }}>Kalman tuned</span>
-              </div>
-            </div>
-            <div style={{
-              width: "40px",
-              height: "40px",
-              borderRadius: "10px",
-              backgroundColor: "#fdf4ff",
-              color: "#9333ea",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              border: "1px solid #f5d0fe"
-            }}>
-              <Crosshair size={20} />
-            </div>
-          </div>
-        </div>
-
-        {/* Breach Alert Banner */}
+        {/* Geofence Breach Alert Banners */}
         {geofenceAlerts.length > 0 && (
-          <div style={{
-            backgroundColor: geofenceAlerts[0].type === "entered" ? "#eff6ff" : "#fff1f2",
-            border: `1.5px solid ${geofenceAlerts[0].type === "entered" ? "#3b82f6" : "#ef4444"}`,
-            borderRadius: "12px",
-            padding: "10px 16px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            animation: "fadeIn 0.3s ease"
-          }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <AlertTriangle size={18} style={{ color: geofenceAlerts[0].type === "entered" ? "#2563eb" : "#e11d48" }} />
-              <div>
-                <span style={{ fontSize: "12px", fontWeight: 800, color: geofenceAlerts[0].type === "entered" ? "#1e40af" : "#9f1239" }}>
-                  {geofenceAlerts[0].type === "entered" ? "🟢 GEOFENCE ENTRY" : "🔴 GEOFENCE BREACH / EXIT"}
-                </span>
-                <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: 0 }}>
-                  {`${geofenceAlerts[0].deviceName} has ${geofenceAlerts[0].type === "entered" ? "ENTERED" : "EXITED"} boundary "${geofenceAlerts[0].zoneName}"`}
-                </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            {geofenceAlerts.map((alert) => (
+              <div
+                key={alert.id}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  padding: "10px 16px",
+                  borderRadius: "8px",
+                  backgroundColor: alert.type === "exited" ? "#fef2f2" : "#f0fdf4",
+                  border: alert.type === "exited" ? "1px solid #fecaca" : "1px solid #a7f3d0",
+                  color: alert.type === "exited" ? "#b91c1c" : "#047857",
+                  boxShadow: "var(--shadow-sm)"
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "13px", fontWeight: 700 }}>
+                  {alert.type === "exited" ? (
+                    <AlertTriangle size={16} style={{ color: "#ef4444" }} />
+                  ) : (
+                    <CheckCircle2 size={16} style={{ color: "#10b981" }} />
+                  )}
+                  <span>
+                    <b>{alert.deviceName}</b> has {alert.type === "exited" ? "BREACHED (Exited)" : "ENTERED"} geofence <u>{alert.zoneName}</u> ({formatDistance(alert.distance)} from center).
+                  </span>
+                </div>
+                <button
+                  onClick={() => setGeofenceAlerts((prev) => prev.filter((a) => a.id !== alert.id))}
+                  style={{ background: "none", border: "none", cursor: "pointer", color: "inherit", fontSize: "12px", fontWeight: 600 }}
+                >
+                  Dismiss
+                </button>
               </div>
-            </div>
-            <button
-              onClick={() => setGeofenceAlerts((prev) => prev.slice(1))}
-              style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)" }}
-            >
-              <X size={16} />
-            </button>
+            ))}
           </div>
         )}
 
-        {/* 3-COLUMN MAIN DASHBOARD WORKSPACE */}
+        {/* Top Metric Header */}
+        <StatsHeader
+          devices={devices}
+          isSimulating={isSimulating}
+          geofenceCount={geofences.filter((g) => g.enabled).length}
+        />
+
+        {/* Dashboard Grid (Sidebar + Live Map + Telemetry Inspector) */}
         <div style={{
           display: "grid",
-          gridTemplateColumns: "280px 1fr 310px",
+          gridTemplateColumns: "340px 1fr 300px",
           gap: "16px",
-          flex: 1,
-          minHeight: "580px"
+          minHeight: "calc(100vh - 220px)"
         }}>
           
-          {/* LEFT COLUMN: Connected Fleet */}
+          {/* LEFT: Devices List & Filters */}
           <section style={{
             backgroundColor: "#ffffff",
             borderRadius: "var(--radius-lg)",
@@ -706,148 +793,217 @@ export default function GeofenceDashboardPage() {
             flexDirection: "column",
             overflow: "hidden"
           }}>
-            {/* Fleet Header */}
-            <div style={{ padding: "16px", borderBottom: "1px solid var(--border-light)", display: "flex", flexDirection: "column", gap: "12px" }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <Radio size={16} style={{ color: "var(--emerald-primary)" }} />
-                  <h2 style={{ fontSize: "13px", fontWeight: 800, color: "#0f172a" }}>Connected Fleet</h2>
+            {/* Sidebar Header */}
+            <div style={{ padding: "16px", borderBottom: "1px solid var(--border-light)" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <Radio size={18} style={{ color: "var(--emerald-primary)" }} />
+                  <h2 style={{ fontSize: "15px", fontWeight: 800, color: "var(--emerald-dark)" }}>
+                    Connected Fleet
+                  </h2>
                 </div>
-                <span style={{
-                  fontSize: "10px",
-                  fontWeight: 800,
-                  backgroundColor: "#ecfdf5",
-                  color: "#065f46",
-                  padding: "2px 8px",
-                  borderRadius: "6px",
-                  border: "1px solid #a7f3d0"
-                }}>
-                  {filteredDevices.length} Targets
-                </span>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span style={{
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    backgroundColor: "var(--bg-green-pill)",
+                    color: "var(--emerald-primary)",
+                    padding: "2px 8px",
+                    borderRadius: "var(--radius-full)"
+                  }}>
+                    {filteredDevices.length} Nodes
+                  </span>
+                  {devices.length > 0 && (
+                    <button
+                      onClick={handleClearAllDevices}
+                      title="Clear / Reset all nodes"
+                      style={{
+                        background: "none",
+                        border: "1px solid var(--border-light)",
+                        borderRadius: "6px",
+                        padding: "2px 6px",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "var(--text-muted)",
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "3px"
+                      }}
+                    >
+                      <Trash2 size={11} />
+                      <span>Clear</span>
+                    </button>
+                  )}
+                </div>
               </div>
 
-              {/* Search Bar */}
-              <div style={{ position: "relative" }}>
-                <Search size={14} style={{ position: "absolute", left: "10px", top: "50%", transform: "translateY(-50%)", color: "var(--text-muted)" }} />
+              {/* Search Box */}
+              <div style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                backgroundColor: "#f8faf9",
+                border: "1px solid var(--border-light)",
+                borderRadius: "8px",
+                padding: "8px 12px",
+                marginBottom: "8px"
+              }}>
+                <Search size={14} style={{ color: "var(--text-muted)" }} />
                 <input
                   type="text"
-                  placeholder="Search device ID or name..."
+                  placeholder="Search device name or ID..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   style={{
-                    width: "100%",
-                    padding: "7px 10px 7px 30px",
-                    borderRadius: "6px",
-                    border: "1px solid var(--border-light)",
+                    border: "none",
+                    background: "transparent",
+                    outline: "none",
                     fontSize: "12px",
-                    backgroundColor: "var(--bg-card-muted)",
-                    outline: "none"
+                    width: "100%",
+                    color: "var(--text-main)"
                   }}
                 />
               </div>
 
-              {/* Type Filter Buttons */}
-              <div style={{ display: "flex", gap: "6px" }}>
-                {["all", "phone", "vehicle", "drone"].map((t) => (
+              {/* Filter Pills */}
+              <div style={{ display: "flex", gap: "6px", overflowX: "auto", paddingBottom: "2px" }}>
+                {["all", "phone", "station", "raspberry-pi", "vehicle", "drone"].map((t) => (
                   <button
                     key={t}
                     onClick={() => setTypeFilter(t)}
                     style={{
-                      padding: "3px 8px",
-                      borderRadius: "4px",
-                      fontSize: "10px",
-                      fontWeight: 700,
+                      border: "none",
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      padding: "4px 8px",
+                      borderRadius: "6px",
                       cursor: "pointer",
-                      border: typeFilter === t ? "1px solid #059669" : "1px solid var(--border-light)",
-                      backgroundColor: typeFilter === t ? "#ecfdf5" : "#ffffff",
-                      color: typeFilter === t ? "#065f46" : "var(--text-secondary)",
-                      textTransform: "capitalize"
+                      whiteSpace: "nowrap",
+                      backgroundColor: typeFilter === t ? "var(--bg-green-tint)" : "#ffffff",
+                      color: typeFilter === t ? "var(--emerald-primary)" : "var(--text-muted)",
+                      borderWidth: "1px",
+                      borderStyle: "solid",
+                      borderColor: typeFilter === t ? "var(--border-green)" : "var(--border-light)"
                     }}
                   >
-                    {t}
+                    {t === "all" ? "All Types" : t === "station" ? "Base Station" : t.replace("-", " ")}
                   </button>
                 ))}
               </div>
             </div>
 
-            {/* Device List */}
-            <div style={{ flex: 1, overflowY: "auto", padding: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
-              {filteredDevices.map((device) => {
-                const isSelected = selectedDevice?.device_id === device.device_id;
-                const isStation = device.type === "station";
+            {/* Scrollable Device Cards List */}
+            <div style={{
+              padding: "12px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "10px",
+              overflowY: "auto",
+              flex: 1
+            }}>
+              {filteredDevices.map((device) => (
+                <DeviceCard
+                  key={device.device_id}
+                  device={device}
+                  isSelected={selectedDevice?.device_id === device.device_id}
+                  onSelect={(d) => setSelectedDevice(d)}
+                  onFocus={handleFocusDevice}
+                  showTrail={Boolean(activeTrails[device.device_id])}
+                  onToggleTrail={handleToggleTrail}
+                  geofences={geofences}
+                  onRemove={handleRemoveDevice}
+                />
+              ))}
 
-                return (
-                  <div
-                    key={device.device_id}
-                    onClick={() => handleFocusDevice(device)}
-                    style={{
-                      padding: "10px 12px",
-                      borderRadius: "8px",
-                      border: isSelected ? "1.5px solid var(--emerald-primary)" : "1px solid var(--border-light)",
-                      backgroundColor: isSelected ? "#f0fdf4" : "#ffffff",
-                      cursor: "pointer",
-                      transition: "all 0.15s ease",
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: "4px"
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                        <div style={{
-                          width: "7px",
-                          height: "7px",
-                          borderRadius: "50%",
-                          backgroundColor: isStation ? "#2563eb" : device.online ? "#059669" : "#94a3b8"
-                        }} className={device.online ? "pulse-active" : ""} />
-                        <span style={{ fontSize: "12px", fontWeight: 700, color: "#0f172a" }}>
-                          {device.name || device.device_id}
-                        </span>
-                      </div>
-                      <span style={{ fontSize: "10px", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>
-                        {device.type}
-                      </span>
+              {filteredDevices.length === 0 && (
+                <div style={{
+                  textAlign: "center",
+                  padding: "36px 16px",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "12px"
+                }}>
+                  <div style={{
+                    width: "44px",
+                    height: "44px",
+                    borderRadius: "50%",
+                    backgroundColor: "var(--bg-green-tint)",
+                    color: "var(--emerald-primary)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center"
+                  }}>
+                    <Smartphone size={22} />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-main)" }}>
+                      No Devices Connected
                     </div>
-
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "var(--text-muted)", fontFamily: "'JetBrains Mono', monospace" }}>
-                      <span>{device.lat.toFixed(4)}°, {device.lon.toFixed(4)}°</span>
-                      <span style={{ color: "#059669", fontWeight: 700 }}>
-                        {device.speed_mps ? `${(device.speed_mps * 3.6).toFixed(1)} km/h` : "0 km/h"}
-                      </span>
+                    <div style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "4px", lineHeight: 1.4 }}>
+                      Open the broadcaster on your phone or toggle Laptop Station to stream coordinates live.
                     </div>
                   </div>
-                );
-              })}
+                  <button
+                    onClick={() => setIsPhoneGuideOpen(true)}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      padding: "8px 14px",
+                      borderRadius: "8px",
+                      backgroundColor: "var(--emerald-primary)",
+                      color: "#ffffff",
+                      border: "none",
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      cursor: "pointer",
+                      boxShadow: "0 2px 8px rgba(5, 150, 105, 0.25)",
+                      marginTop: "4px"
+                    }}
+                  >
+                    <span>Connect Phone Guide</span>
+                    <QrCode size={13} />
+                  </button>
+                </div>
+              )}
             </div>
 
-            {/* Connect CTA Button */}
-            <div style={{ padding: "12px", borderTop: "1px solid var(--border-light)" }}>
+            {/* Quick Share Link */}
+            <div style={{
+              padding: "12px 16px",
+              borderTop: "1px solid var(--border-light)",
+              backgroundColor: "#fcfdfc",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between"
+            }}>
+              <span style={{ fontSize: "12px", color: "var(--text-secondary)", fontWeight: 500 }}>
+                Stream phone GPS:
+              </span>
               <button
                 onClick={() => setIsPhoneGuideOpen(true)}
                 style={{
-                  width: "100%",
                   display: "flex",
                   alignItems: "center",
-                  justifyContent: "center",
-                  gap: "6px",
-                  padding: "9px",
-                  borderRadius: "8px",
-                  backgroundColor: "#0f172a",
-                  color: "#ffffff",
+                  gap: "4px",
                   fontSize: "12px",
                   fontWeight: 700,
+                  color: "var(--emerald-primary)",
+                  background: "none",
                   border: "none",
-                  cursor: "pointer",
-                  boxShadow: "0 2px 6px rgba(15, 23, 42, 0.2)"
+                  cursor: "pointer"
                 }}
               >
-                <Smartphone size={14} />
-                <span>Connect Phone / Hardware</span>
+                <span>/phone</span>
+                <ExternalLink size={12} />
               </button>
             </div>
           </section>
 
-          {/* CENTER COLUMN: The Advanced Live Map Canvas */}
+          {/* CENTER: Interactive Live Map */}
           <section style={{
             backgroundColor: "#ffffff",
             borderRadius: "var(--radius-lg)",
@@ -895,7 +1051,12 @@ export default function GeofenceDashboardPage() {
                 gap: "12px",
                 animation: "fadeIn 0.2s ease"
               }}>
-                <div style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: "#2563eb" }} className="pulse-active" />
+                <div style={{
+                  width: "10px",
+                  height: "10px",
+                  borderRadius: "50%",
+                  backgroundColor: "#2563eb"
+                }} className="pulse-active" />
                 <div style={{ display: "flex", flexDirection: "column" }}>
                   <span style={{ fontSize: "12px", fontWeight: 800, color: "#1e40af" }}>
                     🎯 Pinpoint Base Station Active
@@ -1012,28 +1173,34 @@ export default function GeofenceDashboardPage() {
             )}
           </section>
 
-          {/* RIGHT COLUMN: Configuration & Telemetry */}
+          {/* RIGHT: Geofencing & Telemetry Inspector */}
           <section style={{
+            backgroundColor: "#ffffff",
+            borderRadius: "var(--radius-lg)",
+            border: "1px solid var(--border-light)",
+            boxShadow: "var(--shadow-sm)",
             display: "flex",
             flexDirection: "column",
-            gap: "14px"
+            gap: "14px",
+            padding: "16px",
+            overflowY: "auto"
           }}>
-            
-            {/* Geofence Perimeter Quick Manager */}
+            {/* Geofencing Summary Card */}
             <div style={{
-              backgroundColor: "#ffffff",
-              borderRadius: "var(--radius-lg)",
+              backgroundColor: "var(--bg-card-muted)",
               border: "1px solid var(--border-light)",
-              padding: "16px",
-              boxShadow: "var(--shadow-sm)",
+              borderRadius: "var(--radius-md)",
+              padding: "14px",
               display: "flex",
               flexDirection: "column",
               gap: "10px"
             }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <Shield size={16} style={{ color: "var(--emerald-primary)" }} />
-                  <h3 style={{ fontSize: "13px", fontWeight: 800, color: "#0f172a" }}>Geofences</h3>
+                  <ShieldCheck size={16} style={{ color: "var(--emerald-primary)" }} />
+                  <span style={{ fontSize: "12px", fontWeight: 800, color: "var(--emerald-dark)", textTransform: "uppercase" }}>
+                    Geofences ({geofences.filter(g => g.enabled).length})
+                  </span>
                 </div>
                 <button
                   onClick={() => setIsGeofenceModalOpen(true)}
@@ -1041,254 +1208,385 @@ export default function GeofenceDashboardPage() {
                     display: "flex",
                     alignItems: "center",
                     gap: "4px",
-                    padding: "4px 8px",
-                    borderRadius: "6px",
-                    backgroundColor: "#ecfdf5",
-                    color: "#065f46",
-                    border: "1px solid #a7f3d0",
-                    fontSize: "11px",
+                    background: "none",
+                    border: "none",
+                    color: "var(--emerald-primary)",
+                    fontSize: "12px",
                     fontWeight: 700,
                     cursor: "pointer"
                   }}
                 >
-                  <Plus size={12} />
-                  <span>Manage</span>
+                  <PlusCircle size={14} />
+                  <span>Configure</span>
                 </button>
               </div>
 
-              {geofences.length === 0 ? (
-                <p style={{ fontSize: "12px", color: "var(--text-muted)", lineHeight: 1.4, margin: 0 }}>
-                  No active boundaries. Click "+ Waypoint Drawing" or "Manage" to configure a custom perimeter.
-                </p>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "140px", overflowY: "auto" }}>
-                  {geofences.map((g) => (
-                    <div
-                      key={g.id}
-                      style={{
-                        padding: "6px 8px",
-                        borderRadius: "6px",
-                        backgroundColor: "#f8fafc",
-                        border: "1px solid var(--border-light)",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        fontSize: "11px"
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                        <div style={{ width: "8px", height: "8px", borderRadius: "2px", backgroundColor: g.color }} />
-                        <span style={{ fontWeight: 700, color: "#0f172a" }}>{g.name}</span>
+              {geofences.length > 0 ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                  {geofences.map((zone) => {
+                    const isPoly = zone.type === "polygon" && zone.waypoints && zone.waypoints.length >= 3;
+                    const perimeter = isPoly && zone.waypoints ? calculatePolygonPerimeterMeters(zone.waypoints) : 0;
+                    return (
+                      <div
+                        key={zone.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          fontSize: "12px",
+                          padding: "6px 8px",
+                          backgroundColor: "#ffffff",
+                          borderRadius: "6px",
+                          border: "1px solid var(--border-light)"
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                          <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: zone.color }} />
+                          <span style={{ fontWeight: 600, color: "var(--text-main)" }}>{zone.name}</span>
+                        </div>
+                        <span style={{ color: "var(--text-muted)", fontSize: "11px", fontWeight: 700 }}>
+                          {isPoly && zone.waypoints ? `📍 ${zone.waypoints.length} pts · ${formatDistance(perimeter)}` : `🔵 ${formatDistance(zone.radiusMeters)}`}
+                        </span>
                       </div>
-                      <span style={{ fontSize: "10px", color: "var(--text-muted)" }}>
-                        {g.type === "polygon" ? `${g.waypoints?.length || 0} pts` : formatDistance(g.radiusMeters)}
-                      </span>
-                    </div>
-                  ))}
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ fontSize: "12px", color: "var(--text-muted)", lineHeight: 1.4 }}>
+                  No active boundaries. Click configure to set up a circular or multi-waypoint perimeter.
                 </div>
               )}
-
-              <button
-                onClick={() => {
-                  setIsDrawingWaypoints(true);
-                  setDrawingWaypoints([]);
-                }}
-                style={{
-                  width: "100%",
-                  padding: "7px",
-                  borderRadius: "6px",
-                  backgroundColor: "#f0fdf4",
-                  border: "1px dashed #059669",
-                  color: "#065f46",
-                  fontSize: "11px",
-                  fontWeight: 700,
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: "6px"
-                }}
-              >
-                <PenTool size={12} />
-                <span>+ Draw Waypoint Polygon on Map</span>
-              </button>
             </div>
 
-            {/* Target Telemetry Card */}
-            <div style={{
-              backgroundColor: "#ffffff",
-              borderRadius: "var(--radius-lg)",
-              border: "1px solid var(--border-light)",
-              padding: "16px",
-              boxShadow: "var(--shadow-sm)",
-              display: "flex",
-              flexDirection: "column",
-              gap: "12px",
-              flex: 1
-            }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <Activity size={16} style={{ color: isServerStation ? "#2563eb" : "var(--emerald-primary)" }} />
-                  <h3 style={{ fontSize: "13px", fontWeight: 800, color: isServerStation ? "#1e40af" : "#0f172a" }}>
-                    {isServerStation ? "Base Station Origin" : "Target Telemetry"}
-                  </h3>
-                </div>
+            {/* Live Telemetry Specs for Selected Device / Server Station */}
+            {(() => {
+              const isServerStation = !selectedDevice || selectedDevice.device_id === "station-laptop" || selectedDevice.type === "station";
+              const currentDevice = selectedDevice || devices.find((d) => d.device_id === "station-laptop") || (laptopLocation ? {
+                device_id: "station-laptop",
+                name: "Command Station (Laptop / Server)",
+                type: "station" as const,
+                lat: laptopLocation.lat,
+                lon: laptopLocation.lon,
+                accuracy_m: laptopLocation.accuracy,
+                speed_mps: 0,
+                altitude_m: laptopLocation.altitude,
+                timestamp: Date.now() / 1000,
+                online: true,
+                color: "#2563eb",
+                history: [{ lat: laptopLocation.lat, lon: laptopLocation.lon, timestamp: Date.now() / 1000 }]
+              } : null);
 
-                {isServerStation ? (
-                  <span style={{ fontSize: "9px", fontWeight: 800, backgroundColor: "#eff6ff", color: "#2563eb", padding: "2px 6px", borderRadius: "4px" }}>
-                    💻 LAPTOP ORIGIN
-                  </span>
-                ) : (
-                  <span style={{ fontSize: "9px", fontWeight: 800, backgroundColor: "#f0fdf4", color: "#059669", padding: "2px 6px", borderRadius: "4px" }}>
-                    ONLINE
-                  </span>
-                )}
-              </div>
-
-              {/* Station Calibration Bar (if inspecting Laptop Station) */}
-              {isServerStation && (
-                <div style={{
-                  backgroundColor: "#f8fafc",
-                  border: "1px solid #bfdbfe",
-                  borderRadius: "8px",
-                  padding: "8px 10px",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "6px"
-                }}>
+              return (
+                <>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span style={{ fontSize: "11px", fontWeight: 700, color: "#1e40af" }}>
-                      {laptopLocation?.label || "Base Origin"}
-                    </span>
-                    <button
-                      onClick={() => setIsCalibrateModalOpen(true)}
-                      style={{
-                        padding: "3px 8px",
-                        borderRadius: "4px",
-                        backgroundColor: "#2563eb",
-                        color: "#ffffff",
-                        fontSize: "10px",
-                        fontWeight: 700,
-                        border: "none",
-                        cursor: "pointer"
-                      }}
-                    >
-                      Calibrate Pin
-                    </button>
+                    <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                      <Activity size={18} style={{ color: isServerStation ? "#2563eb" : "var(--emerald-primary)" }} />
+                      <h3 style={{ fontSize: "14px", fontWeight: 800, color: isServerStation ? "#1e40af" : "var(--emerald-dark)" }}>
+                        {isServerStation ? "Server Telemetry" : "Target Telemetry"}
+                      </h3>
+                    </div>
+                    
+                    <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                      {isServerStation ? (
+                        <span style={{
+                          fontSize: "10px",
+                          fontWeight: 800,
+                          backgroundColor: "#eff6ff",
+                          color: "#2563eb",
+                          border: "1px solid #bfdbfe",
+                          padding: "2px 8px",
+                          borderRadius: "4px",
+                          letterSpacing: "0.03em"
+                        }}>
+                          💻 SERVER ORIGIN
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            const station = devices.find((d) => d.device_id === "station-laptop");
+                            if (station) handleFocusDevice(station);
+                          }}
+                          style={{
+                            fontSize: "10px",
+                            fontWeight: 700,
+                            backgroundColor: "#eff6ff",
+                            color: "#2563eb",
+                            border: "1px solid #bfdbfe",
+                            padding: "2px 6px",
+                            borderRadius: "4px",
+                            cursor: "pointer"
+                          }}
+                          title="Switch to Server Laptop Station"
+                        >
+                          ← Server Origin
+                        </button>
+                      )}
+
+                      {currentDevice?.online && (
+                        <span style={{
+                          fontSize: "10px",
+                          fontWeight: 700,
+                          backgroundColor: "#f0fdf4",
+                          color: "#059669",
+                          border: "1px solid #a7f3d0",
+                          padding: "2px 6px",
+                          borderRadius: "4px"
+                        }}>
+                          ONLINE
+                        </span>
+                      )}
+                    </div>
                   </div>
 
-                  {/* 1-Click Phone Satellite Sync */}
-                  {(() => {
-                    const phoneDev = devices.find((d) => d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster");
-                    if (!phoneDev) return null;
-                    return (
+                  {currentDevice ? (
+                    <>
+                      {/* 360° Compass Dial if device provides heading or for server orientation */}
+                      {(currentDevice.heading !== undefined && currentDevice.heading !== null) ? (
+                        <div style={{
+                          backgroundColor: "#fcfdfc",
+                          border: "1px solid var(--border-light)",
+                          borderRadius: "var(--radius-md)",
+                          padding: "12px",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-around"
+                        }}>
+                          <div style={{ position: "relative", width: "70px", height: "70px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <div style={{
+                              position: "absolute",
+                              inset: 0,
+                              borderRadius: "50%",
+                              border: "1.5px dashed var(--border-light)",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center"
+                            }}>
+                              <span style={{ position: "absolute", top: "1px", fontSize: "8px", fontWeight: 800, color: "#ef4444" }}>N</span>
+                            </div>
+                            <div style={{
+                              width: "3px",
+                              height: "54px",
+                              position: "relative",
+                              transform: `rotate(${currentDevice.heading}deg)`,
+                              transition: "transform 0.2s ease-out"
+                            }}>
+                              <div style={{ width: "100%", height: "50%", backgroundColor: "#ef4444", borderRadius: "2px 2px 0 0" }} />
+                              <div style={{ width: "100%", height: "50%", backgroundColor: "var(--text-muted)", borderRadius: "0 0 2px 2px" }} />
+                            </div>
+                            <div style={{ position: "absolute", width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#ffffff", border: "2px solid var(--emerald-primary)" }} />
+                          </div>
+
+                          <div>
+                            <div style={{ fontSize: "10px", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>
+                              True Heading
+                            </div>
+                            <div style={{ fontSize: "18px", fontWeight: 800, color: isServerStation ? "#2563eb" : "var(--emerald-dark)", fontFamily: "'JetBrains Mono', monospace" }}>
+                              {currentDevice.heading}°
+                            </div>
+                            {currentDevice.pitch != null && (
+                              <div style={{ fontSize: "10px", color: "var(--text-secondary)", marginTop: "2px" }}>
+                                Pitch: {currentDevice.pitch}° · Roll: {currentDevice.roll}°
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ) : isServerStation && (
+                        <div style={{
+                          backgroundColor: "#f8fafc",
+                          border: "1px solid #bfdbfe",
+                          borderRadius: "var(--radius-md)",
+                          padding: "10px 14px",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "8px"
+                        }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                              <div style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#2563eb" }} className="pulse-active" />
+                              <span style={{ fontSize: "12px", fontWeight: 700, color: "#1e40af" }}>
+                                {laptopLocation?.label || "Base Command Origin"}
+                              </span>
+                            </div>
+                            <button
+                              onClick={() => setIsCalibrateModalOpen(true)}
+                              title="Calibrate or pinpoint laptop base station"
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "4px",
+                                background: "#2563eb",
+                                border: "none",
+                                borderRadius: "6px",
+                                padding: "4px 8px",
+                                fontSize: "11px",
+                                fontWeight: 700,
+                                color: "#ffffff",
+                                cursor: "pointer",
+                                boxShadow: "0 2px 6px rgba(37, 99, 235, 0.25)"
+                              }}
+                            >
+                              <Crosshair size={12} />
+                              <span>Calibrate Position</span>
+                            </button>
+                          </div>
+
+                          {/* Quick 1-Click Phone Satellite Sync if phone is connected */}
+                          {(() => {
+                            const phoneDev = devices.find((d) => d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster");
+                            if (!phoneDev) return null;
+                            return (
+                              <button
+                                onClick={() => handleSaveStationCalibration(phoneDev.lat, phoneDev.lon, Math.min(phoneDev.accuracy_m || 2, 3), "Synced from Phone GNSS")}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  gap: "6px",
+                                  width: "100%",
+                                  padding: "6px",
+                                  borderRadius: "6px",
+                                  backgroundColor: "#f0fdf4",
+                                  border: "1px solid #bbf7d0",
+                                  color: "#166534",
+                                  fontSize: "11px",
+                                  fontWeight: 700,
+                                  cursor: "pointer"
+                                }}
+                              >
+                                <Satellite size={13} />
+                                <span>1-Click Sync to Phone GPS (±{Math.round(phoneDev.accuracy_m || 2)}m)</span>
+                              </button>
+                            );
+                          })()}
+                        </div>
+                      )}
+
+                      <div style={{
+                        backgroundColor: "#fcfdfc",
+                        border: "1px solid var(--border-light)",
+                        borderRadius: "var(--radius-md)",
+                        padding: "14px",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "10px"
+                      }}>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                          <span style={{ fontSize: "11px", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>
+                            {isServerStation ? "Server / Laptop GPS Metrics" : "GPS & Motion Metrics"}
+                          </span>
+                          <span style={{ fontSize: "10px", fontWeight: 700, color: isServerStation ? "#2563eb" : "var(--emerald-primary)", backgroundColor: isServerStation ? "#eff6ff" : "var(--bg-green-pill)", padding: "1px 6px", borderRadius: "4px" }}>
+                            {isServerStation ? "Base Origin" : currentDevice.type}
+                          </span>
+                        </div>
+
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "13px" }}>
+                          <span style={{ color: "var(--text-secondary)" }}>Latitude</span>
+                          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: "var(--text-main)" }}>
+                            {currentDevice.lat.toFixed(6)}°
+                          </span>
+                        </div>
+
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "13px" }}>
+                          <span style={{ color: "var(--text-secondary)" }}>Longitude</span>
+                          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: "var(--text-main)" }}>
+                            {currentDevice.lon.toFixed(6)}°
+                          </span>
+                        </div>
+
+                        <div style={{ height: "1px", backgroundColor: "var(--border-light)" }} />
+
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "13px" }}>
+                          <span style={{ color: "var(--text-secondary)" }}>Speed</span>
+                          <span style={{ fontWeight: 700, color: isServerStation ? "#2563eb" : "var(--emerald-dark)" }}>
+                            {currentDevice.speed_mps ? `${(currentDevice.speed_mps * 3.6).toFixed(1)} km/h` : "0.0 km/h"}
+                          </span>
+                        </div>
+
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "13px" }}>
+                          <span style={{ color: "var(--text-secondary)" }}>Altitude</span>
+                          <span style={{ fontWeight: 700, color: "var(--text-main)" }}>
+                            {currentDevice.altitude_m ? `${Math.round(currentDevice.altitude_m)} m` : "Ground Level"}
+                          </span>
+                        </div>
+
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "13px" }}>
+                          <span style={{ color: "var(--text-secondary)" }}>Accuracy</span>
+                          <span style={{ fontWeight: 700, color: isServerStation ? "#2563eb" : "var(--emerald-primary)" }}>
+                            {currentDevice.accuracy_m ? `±${Math.round(currentDevice.accuracy_m)} meters` : "±5 meters"}
+                          </span>
+                        </div>
+
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "13px" }}>
+                          <span style={{ color: "var(--text-secondary)" }}>Breadcrumbs</span>
+                          <span style={{ fontWeight: 700, color: "var(--text-main)" }}>
+                            {currentDevice.history?.length || 1} points
+                          </span>
+                        </div>
+
+                        <div style={{
+                          marginTop: "2px",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          fontSize: "11px",
+                          fontWeight: 700,
+                          backgroundColor: "#f0fdf4",
+                          border: "1px solid #bbf7d0",
+                          borderRadius: "6px",
+                          padding: "5px 8px",
+                          color: "#166534"
+                        }}>
+                          <span>✨ 2D Kinematic Kalman Filter</span>
+                          <span style={{ backgroundColor: "#dcfce7", padding: "1px 6px", borderRadius: "4px", fontSize: "10px", fontWeight: 800 }}>ACTIVE</span>
+                        </div>
+                      </div>
+
+                      {/* Locate Action Button */}
                       <button
-                        onClick={() => handleSaveStationCalibration(phoneDev.lat, phoneDev.lon, Math.min(phoneDev.accuracy_m || 2, 3), "Synced from Phone GNSS")}
+                        onClick={() => handleFocusDevice(currentDevice)}
                         style={{
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          gap: "4px",
+                          gap: "8px",
                           width: "100%",
-                          padding: "5px",
-                          borderRadius: "4px",
-                          backgroundColor: "#f0fdf4",
-                          border: "1px solid #bbf7d0",
-                          color: "#166534",
-                          fontSize: "10px",
+                          padding: "10px",
+                          borderRadius: "8px",
+                          border: "none",
+                          backgroundColor: isServerStation ? "#2563eb" : "var(--emerald-primary)",
+                          color: "#ffffff",
                           fontWeight: 700,
-                          cursor: "pointer"
+                          fontSize: "13px",
+                          cursor: "pointer",
+                          boxShadow: isServerStation ? "0 4px 12px rgba(37, 99, 235, 0.25)" : "0 4px 12px rgba(5, 150, 105, 0.25)",
+                          transition: "all 0.2s"
                         }}
                       >
-                        <Satellite size={12} />
-                        <span>1-Click Sync to Phone GPS (±{Math.round(phoneDev.accuracy_m || 2)}m)</span>
+                        <Target size={16} />
+                        <span>{isServerStation ? "Center Server Origin on Map" : "Center Target on Map"}</span>
                       </button>
-                    );
-                  })()}
-                </div>
-              )}
-
-              {/* Coordinates Grid */}
-              {currentDevice ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                    <div style={{ padding: "8px", backgroundColor: "#f8fafc", borderRadius: "6px", border: "1px solid var(--border-light)" }}>
-                      <span style={{ fontSize: "10px", fontWeight: 700, color: "var(--text-muted)", display: "block" }}>LATITUDE</span>
-                      <span style={{ fontSize: "12px", fontWeight: 800, fontFamily: "'JetBrains Mono', monospace", color: "#0f172a" }}>
-                        {currentDevice.lat.toFixed(5)}°
-                      </span>
+                    </>
+                  ) : (
+                    <div style={{
+                      textAlign: "center",
+                      padding: "30px 16px",
+                      color: "var(--text-muted)",
+                      fontSize: "13px",
+                      border: "1px dashed var(--border-light)",
+                      borderRadius: "var(--radius-md)"
+                    }}>
+                      Acquiring Laptop / Server Coordinates...
                     </div>
-                    <div style={{ padding: "8px", backgroundColor: "#f8fafc", borderRadius: "6px", border: "1px solid var(--border-light)" }}>
-                      <span style={{ fontSize: "10px", fontWeight: 700, color: "var(--text-muted)", display: "block" }}>LONGITUDE</span>
-                      <span style={{ fontSize: "12px", fontWeight: 800, fontFamily: "'JetBrains Mono', monospace", color: "#0f172a" }}>
-                        {currentDevice.lon.toFixed(5)}°
-                      </span>
-                    </div>
-                  </div>
-
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                    <div style={{ padding: "8px", backgroundColor: "#f8fafc", borderRadius: "6px", border: "1px solid var(--border-light)" }}>
-                      <span style={{ fontSize: "10px", fontWeight: 700, color: "var(--text-muted)", display: "block" }}>SPEED</span>
-                      <span style={{ fontSize: "12px", fontWeight: 800, color: "#059669" }}>
-                        {currentDevice.speed_mps ? `${(currentDevice.speed_mps * 3.6).toFixed(1)} km/h` : "0.0 km/h"}
-                      </span>
-                    </div>
-                    <div style={{ padding: "8px", backgroundColor: "#f8fafc", borderRadius: "6px", border: "1px solid var(--border-light)" }}>
-                      <span style={{ fontSize: "10px", fontWeight: 700, color: "var(--text-muted)", display: "block" }}>ACCURACY</span>
-                      <span style={{ fontSize: "12px", fontWeight: 800, color: "#2563eb" }}>
-                        ±{Math.round(currentDevice.accuracy_m || 2)}m
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* 2D Kalman Filter Active Indicator */}
-                  <div style={{
-                    padding: "6px 8px",
-                    backgroundColor: "#f0fdf4",
-                    border: "1px solid #bbf7d0",
-                    borderRadius: "6px",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    fontSize: "10px",
-                    fontWeight: 700,
-                    color: "#166534"
-                  }}>
-                    <span>✨ 2D Kinematic Kalman Filter</span>
-                    <span style={{ backgroundColor: "#dcfce7", padding: "1px 5px", borderRadius: "3px", fontWeight: 800 }}>ACTIVE</span>
-                  </div>
-
-                  <button
-                    onClick={() => handleFocusDevice(currentDevice)}
-                    style={{
-                      width: "100%",
-                      padding: "8px",
-                      borderRadius: "6px",
-                      backgroundColor: isServerStation ? "#2563eb" : "var(--emerald-primary)",
-                      color: "#ffffff",
-                      fontSize: "12px",
-                      fontWeight: 700,
-                      border: "none",
-                      cursor: "pointer",
-                      marginTop: "4px"
-                    }}
-                  >
-                    📍 Focus on Map
-                  </button>
-                </div>
-              ) : (
-                <p style={{ fontSize: "12px", color: "var(--text-muted)", textAlign: "center", margin: "20px 0" }}>
-                  Select an active target node to stream realtime sensor data.
-                </p>
-              )}
-            </div>
-
+                  )}
+                </>
+              );
+            })()}
           </section>
 
         </div>
-      </div>
+      </main>
 
-      {/* Phone Connect Guide Modal */}
+      {/* Phone Connect Modal */}
       {isPhoneGuideOpen && (
         <div style={{
           position: "fixed",
@@ -1305,83 +1603,187 @@ export default function GeofenceDashboardPage() {
             backgroundColor: "#ffffff",
             borderRadius: "var(--radius-lg)",
             border: "1px solid var(--border-light)",
-            boxShadow: "0 20px 40px rgba(0, 0, 0, 0.15)",
+            boxShadow: "0 20px 40px rgba(6, 78, 59, 0.15)",
             width: "100%",
-            maxWidth: "500px",
-            padding: "24px"
+            maxWidth: "520px",
+            maxHeight: "90vh",
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column"
           }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-              <h2 style={{ fontSize: "16px", fontWeight: 800, color: "#0f172a" }}>
-                Connect Phone Broadcaster
-              </h2>
-              <button onClick={() => setIsPhoneGuideOpen(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)" }}>
+            {/* Modal Header */}
+            <div style={{
+              padding: "20px 24px",
+              borderBottom: "1px solid var(--border-light)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between"
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <div style={{
+                  width: "36px",
+                  height: "36px",
+                  borderRadius: "10px",
+                  backgroundColor: "var(--bg-green-tint)",
+                  color: "var(--emerald-primary)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center"
+                }}>
+                  <Smartphone size={20} />
+                </div>
+                <div>
+                  <h2 style={{ fontSize: "17px", fontWeight: 800, color: "var(--emerald-dark)" }}>
+                    Connect Smartphone GPS & IMU
+                  </h2>
+                  <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "1px" }}>
+                    Stream live GPS and compass orientation from any mobile device
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsPhoneGuideOpen(false)}
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", padding: "4px" }}
+              >
                 <X size={20} />
               </button>
             </div>
 
-            <p style={{ fontSize: "13px", color: "var(--text-secondary)", lineHeight: 1.5, marginBottom: "16px" }}>
-              Open this link on your smartphone to stream live dual-frequency GPS coordinates, orientation compass heading, and accelerometer velocity:
-            </p>
-
-            <div style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              padding: "10px",
-              borderRadius: "8px",
-              backgroundColor: "var(--bg-card-muted)",
-              border: "1px solid var(--border-light)",
-              marginBottom: "16px"
-            }}>
-              <span style={{ fontSize: "13px", fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: "#0f172a", flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>
-                http://{hostUrl}/phone
-              </span>
-              <button
-                onClick={() => {
-                  navigator.clipboard.writeText(`http://${hostUrl}/phone`);
-                  setCopiedLink(true);
-                  setTimeout(() => setCopiedLink(false), 2000);
-                }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "4px",
-                  padding: "6px 12px",
-                  borderRadius: "6px",
+            {/* Modal Body */}
+            <div style={{ padding: "24px", display: "flex", flexDirection: "column", gap: "16px" }}>
+              {/* Step 1 */}
+              <div style={{ display: "flex", gap: "12px" }}>
+                <div style={{
+                  width: "26px",
+                  height: "26px",
+                  borderRadius: "50%",
                   backgroundColor: "var(--emerald-primary)",
                   color: "#ffffff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
                   fontSize: "12px",
-                  fontWeight: 700,
-                  border: "none",
-                  cursor: "pointer"
-                }}
-              >
-                {copiedLink ? <Check size={14} /> : <Copy size={14} />}
-                <span>{copiedLink ? "Copied" : "Copy"}</span>
-              </button>
-            </div>
+                  fontWeight: 800,
+                  flexShrink: 0
+                }}>
+                  1
+                </div>
+                <div>
+                  <div style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-main)" }}>
+                    Connect phone to same Wi-Fi network
+                  </div>
+                  <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "2px" }}>
+                    Ensure your smartphone and this laptop are on the same local Wi-Fi or mobile hotspot.
+                  </div>
+                </div>
+              </div>
 
-            <Link
-              href="/phone"
-              target="_blank"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: "6px",
-                width: "100%",
-                padding: "10px",
+              {/* Step 2 */}
+              <div style={{ display: "flex", gap: "12px" }}>
+                <div style={{
+                  width: "26px",
+                  height: "26px",
+                  borderRadius: "50%",
+                  backgroundColor: "var(--emerald-primary)",
+                  color: "#ffffff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: "12px",
+                  fontWeight: 800,
+                  flexShrink: 0
+                }}>
+                  2
+                </div>
+                <div style={{ width: "100%" }}>
+                  <div style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-main)" }}>
+                    Open URL in phone browser
+                  </div>
+                  <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "2px" }}>
+                    Open Safari (iOS) or Chrome (Android) and navigate to:
+                  </div>
+
+                  {/* Copyable Links */}
+                  <div style={{
+                    marginTop: "8px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    backgroundColor: "#f8faf9",
+                    border: "1.5px solid var(--border-green)",
+                    borderRadius: "8px",
+                    padding: "10px 12px"
+                  }}>
+                    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "13px", fontWeight: 700, color: "var(--emerald-dark)" }}>
+                      https://{hostUrl || "192.168.225.62:3000"}/phone
+                    </span>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(`https://${hostUrl || "192.168.225.62:3000"}/phone`);
+                        setCopiedLink(true);
+                        setTimeout(() => setCopiedLink(false), 2000);
+                      }}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "4px",
+                        padding: "4px 8px",
+                        backgroundColor: "var(--bg-green-pill)",
+                        color: "var(--emerald-dark)",
+                        border: "none",
+                        borderRadius: "6px",
+                        fontSize: "11px",
+                        fontWeight: 700,
+                        cursor: "pointer"
+                      }}
+                    >
+                      {copiedLink ? <Check size={13} /> : <Copy size={13} />}
+                      <span>{copiedLink ? "Copied" : "Copy"}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Step 3 */}
+              <div style={{ display: "flex", gap: "12px" }}>
+                <div style={{
+                  width: "26px",
+                  height: "26px",
+                  borderRadius: "50%",
+                  backgroundColor: "var(--emerald-primary)",
+                  color: "#ffffff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: "12px",
+                  fontWeight: 800,
+                  flexShrink: 0
+                }}>
+                  3
+                </div>
+                <div>
+                  <div style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-main)" }}>
+                    Tap Start Live Broadcast & Allow Permissions
+                  </div>
+                  <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "2px" }}>
+                    When prompted by the mobile browser, tap <b>Allow Location</b> and <b>Enable Compass / Motion sensors</b>.
+                  </div>
+                </div>
+              </div>
+
+              {/* HTTPS Note Alert */}
+              <div style={{
+                backgroundColor: "#ecfdf5",
+                border: "1px solid var(--border-green)",
                 borderRadius: "8px",
-                backgroundColor: "#0f172a",
-                color: "#ffffff",
-                fontSize: "13px",
-                fontWeight: 700,
-                textDecoration: "none"
-              }}
-            >
-              <span>Open Broadcaster in New Tab</span>
-              <ExternalLink size={14} />
-            </Link>
+                padding: "12px",
+                fontSize: "12px",
+                color: "var(--emerald-dark)",
+                lineHeight: 1.5
+              }}>
+                <b>💡 Pro-Tip for GPS & Heading:</b> Mobile browsers enforce HTTPS for GPS & Compass. If accessing over Wi-Fi, run <code>npm run dev:https</code> on your laptop to enable HTTPS.
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -1397,8 +1799,8 @@ export default function GeofenceDashboardPage() {
           setIsDrawingWaypoints(false);
           setDrawingWaypoints([]);
         }}
-        onToggleGeofence={(id) => setGeofences((prev) => prev.map((g) => g.id === id ? { ...g, enabled: !g.enabled } : g))}
-        onRemoveGeofence={(id) => setGeofences((prev) => prev.filter((g) => g.id !== id))}
+        onToggleGeofence={handleToggleGeofence}
+        onRemoveGeofence={handleRemoveGeofence}
         devices={devices}
         selectedDevice={selectedDevice}
         mapCenter={laptopLocation ? [laptopLocation.lat, laptopLocation.lon] : selectedDevice ? [selectedDevice.lat, selectedDevice.lon] : undefined}

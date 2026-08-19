@@ -105,14 +105,77 @@ export default function Navbar({
             fontSize: "13px",
             fontWeight: 600,
             textDecoration: "none",
-            backgroundColor: pathname === "/" ? "var(--bg-green-tint)" : "transparent",
-            color: pathname === "/" ? "var(--emerald-primary)" : "var(--text-secondary)",
-            border: pathname === "/" ? "1px solid var(--border-green)" : "1px solid transparent",
+            backgroundColor: (pathname === "/" || pathname === "/geofence") ? "var(--bg-green-tint)" : "transparent",
+            color: (pathname === "/" || pathname === "/geofence") ? "var(--emerald-primary)" : "var(--text-secondary)",
+            border: (pathname === "/" || pathname === "/geofence") ? "1px solid var(--border-green)" : "1px solid transparent",
             transition: "all 0.2s"
           }}
         >
           <Layers size={16} />
           <span>Dashboard Map</span>
+        </Link>
+
+        <Link 
+          href="/vision" 
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            padding: "8px 14px",
+            borderRadius: "8px",
+            fontSize: "13px",
+            fontWeight: 600,
+            textDecoration: "none",
+            backgroundColor: pathname === "/vision" ? "var(--bg-green-tint)" : "transparent",
+            color: pathname === "/vision" ? "var(--emerald-primary)" : "var(--text-secondary)",
+            border: pathname === "/vision" ? "1px solid var(--border-green)" : "1px solid transparent",
+            transition: "all 0.2s"
+          }}
+        >
+          <Activity size={16} />
+          <span>Live Vision Feed</span>
+        </Link>
+
+        <Link 
+          href="/slam" 
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            padding: "8px 14px",
+            borderRadius: "8px",
+            fontSize: "13px",
+            fontWeight: 600,
+            textDecoration: "none",
+            backgroundColor: pathname === "/slam" ? "var(--bg-green-tint)" : "transparent",
+            color: pathname === "/slam" ? "var(--emerald-primary)" : "var(--text-secondary)",
+            border: pathname === "/slam" ? "1px solid var(--border-green)" : "1px solid transparent",
+            transition: "all 0.2s"
+          }}
+        >
+          <Navigation size={16} />
+          <span>SLAM Tracking</span>
+        </Link>
+
+        <Link 
+          href="/reports" 
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            padding: "8px 14px",
+            borderRadius: "8px",
+            fontSize: "13px",
+            fontWeight: 600,
+            textDecoration: "none",
+            backgroundColor: pathname === "/reports" ? "var(--bg-green-tint)" : "transparent",
+            color: pathname === "/reports" ? "var(--emerald-primary)" : "var(--text-secondary)",
+            border: pathname === "/reports" ? "1px solid var(--border-green)" : "1px solid transparent",
+            transition: "all 0.2s"
+          }}
+        >
+          <ShieldCheck size={16} />
+          <span>Safety Reports</span>
         </Link>
 
         {onOpenGeofences && (
