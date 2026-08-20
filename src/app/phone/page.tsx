@@ -26,12 +26,14 @@ import {
   EyeOff,
   Video,
   Volume2,
-  VolumeX
+  VolumeX,
+  Cpu
 } from "lucide-react";
 
 import { calculateDistanceMeters, calculateSpeedMps, formatSpeedKmh, projectCoordinates } from "@/lib/geo";
 import { GPSKalmanFilter } from "@/lib/kalman";
 import { ThreatDetection, BlindSpotAlert } from "@/lib/types";
+import { detectObjects, loadObjectDetector } from "@/lib/detector";
 
 export default function PhoneBroadcasterPage() {
   const [deviceId, setDeviceId] = useState("Phone-" + Math.floor(100 + Math.random() * 900));
@@ -39,13 +41,13 @@ export default function PhoneBroadcasterPage() {
   const [status, setStatus] = useState("Ready to start broadcast");
   const [statusType, setStatusType] = useState<"idle" | "active" | "error">("idle");
   
-  // Camera & Video Stream State
+  // Camera & AI State
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [cameraFacing, setCameraFacing] = useState<"environment" | "user">("environment");
   const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
-  const [cameraFps, setCameraFps] = useState(15);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [isUsingSyntheticVideo, setIsUsingSyntheticVideo] = useState(false);
+  const [aiModelLoaded, setAiModelLoaded] = useState(false);
 
   // GPS Coordinates
   const [currentLat, setCurrentLat] = useState<number | null>(null);
@@ -83,17 +85,18 @@ export default function PhoneBroadcasterPage() {
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const lastFrameB64Ref = useRef<string | null>(null);
+  const isDetectingRef = useRef<boolean>(false);
   const animTickRef = useRef<number>(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const highRateIntervalRef = useRef<any>(null);
   const streamTickRef = useRef<any>(null);
-  const cameraFrameIntervalRef = useRef<any>(null);
+  const aiDetectionIntervalRef = useRef<any>(null);
   const simIntervalRef = useRef<any>(null);
   const kalmanRef = useRef<GPSKalmanFilter>(new GPSKalmanFilter(2.5));
   
-  // High-rate state refs for seamless transmission
+  // High-rate state refs for transmission
   const latestLatRef = useRef<number | null>(null);
   const latestLonRef = useRef<number | null>(null);
   const latestAccuracyRef = useRef<number | null>(null);
@@ -103,19 +106,22 @@ export default function PhoneBroadcasterPage() {
   const latestPitchRef = useRef<number | null>(null);
   const latestRollRef = useRef<number | null>(null);
 
-  // Keep refs synced for transmission
   useEffect(() => {
     latestHeadingRef.current = heading;
     latestPitchRef.current = pitch;
     latestRollRef.current = roll;
   }, [heading, pitch, roll]);
 
-  // Check secure context
+  // Pre-load AI Object Detection Model on Mount
   useEffect(() => {
     if (typeof window !== "undefined") {
       setHostIp(window.location.host);
       const secure = window.isSecureContext || window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
       setIsSecure(secure);
+
+      loadObjectDetector()
+        .then(() => setAiModelLoaded(true))
+        .catch(() => {});
 
       if (
         typeof (DeviceOrientationEvent as any) !== "undefined" &&
@@ -138,7 +144,7 @@ export default function PhoneBroadcasterPage() {
     }
   }, []);
 
-  // Listen to IMU Orientation with high-frequency updates
+  // Listen to IMU Orientation
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -182,7 +188,7 @@ export default function PhoneBroadcasterPage() {
     };
   }, []);
 
-  // Synthetic worksite scene drawer for fallback
+  // Synthetic scene renderer for simulation
   const renderSyntheticPhoneScene = (canvas: HTMLCanvasElement, step: number, hdg = 0) => {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -244,7 +250,6 @@ export default function PhoneBroadcasterPage() {
     ctx.fillText(new Date().toLocaleTimeString(), w - 90, 20);
   };
 
-  // Continuous animation loop for synthetic video
   useEffect(() => {
     let animId: any;
     const loop = () => {
@@ -277,9 +282,9 @@ export default function PhoneBroadcasterPage() {
         stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: facing,
-            width: { ideal: 640, max: 1280 },
-            height: { ideal: 480, max: 720 },
-            frameRate: { ideal: cameraFps, max: 30 }
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { ideal: 15 }
           },
           audio: false
         });
@@ -296,21 +301,21 @@ export default function PhoneBroadcasterPage() {
         videoRef.current.play().catch(() => {});
       }
 
-      // Frame capture loop for shared perception
-      if (cameraFrameIntervalRef.current) clearInterval(cameraFrameIntervalRef.current);
-      cameraFrameIntervalRef.current = setInterval(() => {
-        captureAndBroadcastFrame();
-      }, 1000 / cameraFps);
+      // Start Real-Time AI Detection Loop (runs every 280ms)
+      if (aiDetectionIntervalRef.current) clearInterval(aiDetectionIntervalRef.current);
+      aiDetectionIntervalRef.current = setInterval(() => {
+        runRealtimeAiDetection();
+      }, 280);
 
     } catch (err: any) {
-      console.warn("Hardware camera unavailable, activating synthetic worksite camera:", err);
+      console.warn("Hardware camera unavailable, activating synthetic camera:", err);
       setIsUsingSyntheticVideo(true);
       setHasCameraPermission(false);
 
-      if (cameraFrameIntervalRef.current) clearInterval(cameraFrameIntervalRef.current);
-      cameraFrameIntervalRef.current = setInterval(() => {
-        captureAndBroadcastFrame();
-      }, 1000 / cameraFps);
+      if (aiDetectionIntervalRef.current) clearInterval(aiDetectionIntervalRef.current);
+      aiDetectionIntervalRef.current = setInterval(() => {
+        runRealtimeAiDetection();
+      }, 280);
     }
   };
 
@@ -319,9 +324,9 @@ export default function PhoneBroadcasterPage() {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
     }
-    if (cameraFrameIntervalRef.current) {
-      clearInterval(cameraFrameIntervalRef.current);
-      cameraFrameIntervalRef.current = null;
+    if (aiDetectionIntervalRef.current) {
+      clearInterval(aiDetectionIntervalRef.current);
+      aiDetectionIntervalRef.current = null;
     }
     setIsCameraActive(false);
   };
@@ -334,53 +339,86 @@ export default function PhoneBroadcasterPage() {
     }
   };
 
-  const captureAndBroadcastFrame = () => {
-    let sourceCanvasOrVideo: HTMLVideoElement | HTMLCanvasElement | null = null;
+  // REAL-TIME AI OBJECT DETECTION ON CAMERA FRAME
+  const runRealtimeAiDetection = async () => {
+    if (isDetectingRef.current) return;
+    isDetectingRef.current = true;
 
+    let mediaElem: HTMLVideoElement | HTMLCanvasElement | null = null;
     if (mediaStreamRef.current && videoRef.current && videoRef.current.readyState >= 2 && !isUsingSyntheticVideo) {
-      sourceCanvasOrVideo = videoRef.current;
+      mediaElem = videoRef.current;
     } else if (simCanvasRef.current) {
-      sourceCanvasOrVideo = simCanvasRef.current;
+      mediaElem = simCanvasRef.current;
     }
 
-    if (!sourceCanvasOrVideo || !captureCanvasRef.current) return;
+    if (!mediaElem) {
+      isDetectingRef.current = false;
+      return;
+    }
 
-    const canvas = captureCanvasRef.current;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    try {
+      const obsLat = latestLatRef.current || 23.0225;
+      const obsLon = latestLonRef.current || 72.5714;
+      const obsHdg = latestHeadingRef.current || 0;
 
-    canvas.width = 480;
-    canvas.height = 360;
+      // 1. Run AI Inference (COCO-SSD / MobileNet)
+      const detections = await detectObjects(mediaElem, obsLat, obsLon, obsHdg, 70);
 
-    ctx.drawImage(sourceCanvasOrVideo, 0, 0, 480, 360);
+      // Attach device metadata
+      detections.forEach((d) => {
+        d.source_device_id = deviceId;
+      });
 
-    // Get JPEG base64 string
-    const b64 = canvas.toDataURL("image/jpeg", 0.65);
-    lastFrameB64Ref.current = b64;
+      setActiveDetections(detections);
+      activeDetectionsRef.current = detections;
 
-    // Draw active detections on overlay canvas
-    if (overlayCanvasRef.current) {
-      const oCtx = overlayCanvasRef.current.getContext("2d");
-      if (oCtx) {
-        overlayCanvasRef.current.width = 480;
-        overlayCanvasRef.current.height = 360;
-        oCtx.clearRect(0, 0, 480, 360);
+      // 2. Draw Bounding Boxes on in-camera overlay canvas
+      if (overlayCanvasRef.current) {
+        const oCtx = overlayCanvasRef.current.getContext("2d");
+        if (oCtx) {
+          const w = 480;
+          const h = 360;
+          overlayCanvasRef.current.width = w;
+          overlayCanvasRef.current.height = h;
+          oCtx.clearRect(0, 0, w, h);
 
-        activeDetectionsRef.current.forEach((det) => {
-          if (det.bbox) {
-            const [x, y, bw, bh] = det.bbox;
-            oCtx.strokeStyle = "#ef4444";
-            oCtx.lineWidth = 3;
-            oCtx.strokeRect(x, y, bw, bh);
+          detections.forEach((det) => {
+            if (det.bbox) {
+              const [x, y, bw, bh] = det.bbox;
+              const isThreat = ["car", "truck", "bus", "motorcycle", "forklift", "threat"].includes(det.class);
+              const color = isThreat ? "#ef4444" : "#10b981";
 
-            oCtx.fillStyle = "#ef4444";
-            oCtx.fillRect(x, y - 24, bw, 24);
-            oCtx.fillStyle = "#ffffff";
-            oCtx.font = "bold 13px 'JetBrains Mono', monospace";
-            oCtx.fillText(`🚨 ${det.class.toUpperCase()} (${Math.round(det.confidence * 100)}%)`, x + 4, y - 6);
-          }
-        });
+              oCtx.strokeStyle = color;
+              oCtx.lineWidth = 2.5;
+              oCtx.strokeRect(x, y, bw, bh);
+
+              const label = `${det.class.toUpperCase()} ${Math.round(det.confidence * 100)}% (${det.est_distance_m.toFixed(1)}m)`;
+              oCtx.font = "bold 11px 'JetBrains Mono', monospace";
+              const tw = oCtx.measureText(label).width;
+
+              oCtx.fillStyle = color;
+              oCtx.fillRect(x, Math.max(0, y - 18), tw + 8, 18);
+              oCtx.fillStyle = "#ffffff";
+              oCtx.fillText(label, x + 4, Math.max(14, y - 4));
+            }
+          });
+        }
       }
+
+      // 3. Capture compact frame for shared perception broadcast (320x240 @ 0.5 quality ~10KB)
+      if (captureCanvasRef.current) {
+        const canvas = captureCanvasRef.current;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          canvas.width = 320;
+          canvas.height = 240;
+          ctx.drawImage(mediaElem, 0, 0, 320, 240);
+          lastFrameB64Ref.current = canvas.toDataURL("image/jpeg", 0.5);
+        }
+      }
+    } catch (e) {
+    } finally {
+      isDetectingRef.current = false;
     }
   };
 
@@ -438,12 +476,10 @@ export default function PhoneBroadcasterPage() {
       online: true
     };
 
-    // 1. Send over WebSocket if open
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(payload));
     }
 
-    // 2. Send via HTTP POST
     const t0 = Date.now();
     fetch("/api/telemetry", {
       method: "POST",
@@ -499,38 +535,31 @@ export default function PhoneBroadcasterPage() {
 
     sendCurrentPose();
     
-    const accuracyLabel = filtered.accuracy <= 4 ? `🛰️ Kalman Satellite Lock (±${filtered.accuracy.toFixed(1)}m)` : filtered.accuracy <= 12 ? `Good (±${filtered.accuracy.toFixed(1)}m)` : `Coarse (±${Math.round(filtered.accuracy)}m)`;
+    const accuracyLabel = filtered.accuracy <= 4 ? `🛰️ Kalman Lock (±${filtered.accuracy.toFixed(1)}m)` : filtered.accuracy <= 12 ? `Good (±${filtered.accuracy.toFixed(1)}m)` : `Coarse (±${Math.round(filtered.accuracy)}m)`;
     setStatus(`Live GPS: ${filtered.lat.toFixed(6)}, ${filtered.lon.toFixed(6)} · ${accuracyLabel} · ${formatSpeedKmh(speedMps)}`);
     setStatusType("active");
   };
 
   const startBroadcasting = async () => {
     setIsBroadcasting(true);
-    setStatus("Connecting to Telemetry Hub · Acquiring GPS & Camera...");
+    setStatus("Broadcasting Live Telemetry, Camera & AI Detections...");
     setStatusType("active");
 
-    // Auto-start camera
     startCamera();
 
-    // Establish WebSocket Connection
     try {
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
       const host = window.location.hostname;
       const port = "8000";
       const ws = new WebSocket(`${proto}//${host}:${port}/ws/device`);
-
-      ws.onopen = () => {
-        setStatus("Connected to Hub · Live Stream Active");
-      };
+      ws.onopen = () => setStatus("Connected to Hub · Live AI Stream Active");
       wsRef.current = ws;
     } catch (e) {}
 
-    // High-Rate Background Broadcast Heartbeat (streams pose every 250ms)
     streamTickRef.current = setInterval(() => {
       sendCurrentPose();
-    }, 250);
+    }, 280);
 
-    // Simulation check
     if (isSimulatedWalk) {
       startSimulation();
       return;
@@ -542,11 +571,10 @@ export default function PhoneBroadcasterPage() {
           processGpsFix(pos.coords);
         },
         (err) => {
-          console.warn("GPS error:", err.code, err.message);
+          console.warn("GPS notice:", err.message);
           let msg = err.message;
           if (err.code === 1) msg = "Location permission denied. Allow location in browser settings.";
           if (err.code === 2) msg = "Position unavailable. Turn on device GPS.";
-          if (err.code === 3) msg = "GPS satellite acquisition timed out. Retrying...";
           setStatus(`GPS Notice: ${msg}`);
           setStatusType("error");
         },
@@ -596,7 +624,7 @@ export default function PhoneBroadcasterPage() {
       sendCurrentPose();
       setStatus(`Simulated GPS: ${simLat.toFixed(6)}, ${simLon.toFixed(6)} · ${formatSpeedKmh(simSpeedMps)}`);
       setStatusType("active");
-    }, 250);
+    }, 280);
   };
 
   const stopBroadcasting = () => {
@@ -675,7 +703,7 @@ export default function PhoneBroadcasterPage() {
         flexDirection: "column",
         gap: "14px"
       }}>
-        {/* Back Link */}
+        {/* Navigation Strip */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <Link
             href="/geofence"
@@ -710,7 +738,7 @@ export default function PhoneBroadcasterPage() {
           </Link>
         </div>
 
-        {/* Active Blind-Spot Hazard Warning Banner on Phone */}
+        {/* Targeted Blind-Spot Warning Banner */}
         {blindSpotAlerts.length > 0 && (
           <div style={{
             backgroundColor: "#dc2626",
@@ -759,7 +787,7 @@ export default function PhoneBroadcasterPage() {
           boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
           position: "relative"
         }}>
-          {/* Video / Canvas Element */}
+          {/* Video / Canvas Viewport */}
           <div style={{
             position: "relative",
             width: "100%",
@@ -802,7 +830,7 @@ export default function PhoneBroadcasterPage() {
               }}
             />
 
-            {/* Hidden canvas used for JPEG frame encoding */}
+            {/* Hidden canvas for frame encoding */}
             <canvas ref={captureCanvasRef} style={{ display: "none" }} />
 
             {/* Bounding box overlay canvas */}
@@ -822,10 +850,10 @@ export default function PhoneBroadcasterPage() {
               <div style={{ textAlign: "center", color: "#64748b", padding: "20px" }}>
                 <Camera size={48} style={{ opacity: 0.4, margin: "0 auto 12px" }} />
                 <p style={{ fontSize: "14px", fontWeight: 700, margin: 0, color: "#94a3b8" }}>
-                  Camera Standby
+                  AI Camera Standby
                 </p>
                 <p style={{ fontSize: "12px", margin: "4px 0 14px", color: "#64748b" }}>
-                  Tap below to start camera & stream to shared perception
+                  Tap below to start live camera & AI object detection
                 </p>
                 <button
                   onClick={() => startCamera()}
@@ -844,7 +872,7 @@ export default function PhoneBroadcasterPage() {
                   }}
                 >
                   <Camera size={16} />
-                  <span>Start Camera</span>
+                  <span>Start Camera & AI</span>
                 </button>
               </div>
             )}
@@ -874,7 +902,7 @@ export default function PhoneBroadcasterPage() {
                   <Compass size={13} style={{ color: "#38bdf8" }} />
                   <span>{heading !== null ? `${heading}°` : "0°"}</span>
                   <span style={{ color: "#94a3b8" }}>·</span>
-                  <span>{currentSpeed ? formatSpeedKmh(currentSpeed) : "0.0 km/h"}</span>
+                  <span>{activeDetections.length} AI Objects</span>
                 </div>
 
                 {/* Camera Flip Button */}
@@ -898,7 +926,7 @@ export default function PhoneBroadcasterPage() {
                   <RotateCw size={16} />
                 </button>
 
-                {/* Status Indicator */}
+                {/* Live AI Status Badge */}
                 <div style={{
                   position: "absolute",
                   bottom: "10px",
@@ -914,7 +942,7 @@ export default function PhoneBroadcasterPage() {
                   gap: "5px"
                 }}>
                   <span style={{ width: "6px", height: "6px", borderRadius: "50%", backgroundColor: "#ffffff" }} className="pulse-active" />
-                  <span>STREAMING FEED ({isUsingSyntheticVideo ? "SYNTHETIC" : cameraFacing})</span>
+                  <span>AI YOLO ENGINE ACTIVE ({activeDetections.length} DETECTIONS)</span>
                 </div>
               </>
             )}
@@ -971,7 +999,7 @@ export default function PhoneBroadcasterPage() {
             </div>
 
             <span style={{ fontSize: "11px", color: "#64748b", fontFamily: "'JetBrains Mono', monospace" }}>
-              {packetsSent} packets
+              {packetsSent} packets · {aiModelLoaded ? "AI Model Ready" : "Loading Model..."}
             </span>
           </div>
         </div>
@@ -1007,7 +1035,7 @@ export default function PhoneBroadcasterPage() {
                   Phone Pose & Sensors
                 </h2>
                 <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "2px 0 0" }}>
-                  GPS, IMU, and Real-Time YOLO Detections
+                  GPS, IMU, and Real-Time AI Object Detection
                 </p>
               </div>
             </div>
@@ -1101,7 +1129,7 @@ export default function PhoneBroadcasterPage() {
             gap: "8px"
           }}>
             <span style={{ fontSize: "11px", fontWeight: 800, color: "var(--text-secondary)", textTransform: "uppercase" }}>
-              Interactive Threat Perception Generator
+              Threat Test Scenarios
             </span>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
               <button
