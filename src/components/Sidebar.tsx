@@ -3,6 +3,7 @@
 import React, { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import IncidentAnalysisModal from "@/components/IncidentAnalysisModal";
 import { 
   Menu, 
   Map, 
@@ -17,6 +18,7 @@ import {
 
 export default function Sidebar() {
   const [isOpen, setIsOpen] = useState(false);
+  const [isIncidentModalOpen, setIsIncidentModalOpen] = useState(false);
   const pathname = usePathname();
 
   const navItems = [
@@ -167,7 +169,51 @@ export default function Sidebar() {
             </Link>
           );
         })}
+
+        {/* Real Incident Case Study Modal Button */}
+        <button
+          onClick={() => setIsIncidentModalOpen(true)}
+          title={!isOpen ? "Real Incident Case Study" : ""}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+            padding: "10px 12px",
+            borderRadius: "10px",
+            backgroundColor: "#fff1f2",
+            color: "#e11d48",
+            border: "1px solid #fecdd3",
+            fontWeight: 800,
+            fontSize: "13px",
+            cursor: "pointer",
+            marginTop: "6px",
+            transition: "all 0.15s ease",
+            textAlign: "left"
+          }}
+        >
+          <span style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "#e11d48",
+            margin: !isOpen ? "0 auto" : "0",
+            fontSize: "16px"
+          }}>
+            🚨
+          </span>
+          {isOpen && (
+            <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              Incident Case Study
+            </span>
+          )}
+        </button>
       </nav>
+
+      {/* Real Incident Analysis Video & Spatial Reconstruction Modal */}
+      <IncidentAnalysisModal
+        isOpen={isIncidentModalOpen}
+        onClose={() => setIsIncidentModalOpen(false)}
+      />
 
       {/* Footer / Status Indicator */}
       <div style={{

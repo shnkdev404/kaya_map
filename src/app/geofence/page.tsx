@@ -6,6 +6,7 @@ import Sidebar from "@/components/Sidebar";
 import SimulatorModal from "@/components/Dashboard/SimulatorModal";
 import GeofenceModal from "@/components/Dashboard/GeofenceModal";
 import StationCalibrateModal from "@/components/Dashboard/StationCalibrateModal";
+import IncidentAnalysisModal from "@/components/IncidentAnalysisModal";
 import { DeviceTelemetry, SimulationProfile, GeofenceZone, GeofenceAlert, BlindSpotAlert } from "@/lib/types";
 import { 
   calculateDistanceMeters, 
@@ -103,6 +104,7 @@ export default function GeofenceDashboardPage() {
   const [drawingWaypoints, setDrawingWaypoints] = useState<[number, number][]>([]);
   const [geofenceAlerts, setGeofenceAlerts] = useState<GeofenceAlert[]>([]);
   const [blindSpotAlerts, setBlindSpotAlerts] = useState<BlindSpotAlert[]>([]);
+  const [isIncidentModalOpen, setIsIncidentModalOpen] = useState(false);
   const previousContainmentRef = useRef<Record<string, Record<string, boolean>>>({});
 
   // Simulator State
@@ -1494,6 +1496,61 @@ export default function GeofenceDashboardPage() {
         onSaveCalibration={handleSaveStationCalibration}
         onStartMapPinpoint={() => setIsPinpointingStation(true)}
         onResetToAutoGps={handleResetToAutoGps}
+      />
+
+      {/* Floating Interactive Corner Trigger: Real Incident Analysis */}
+      <div style={{
+        position: "fixed",
+        bottom: "22px",
+        right: "22px",
+        zIndex: 900
+      }}>
+        <button
+          onClick={() => setIsIncidentModalOpen(true)}
+          style={{
+            backgroundColor: "#0f172a",
+            color: "#ffffff",
+            border: "2px solid #ef4444",
+            borderRadius: "14px",
+            padding: "10px 16px",
+            boxShadow: "0 10px 30px rgba(239, 68, 68, 0.4)",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+            transition: "transform 0.15s ease",
+            animation: "pulse 2s infinite"
+          }}
+        >
+          <div style={{
+            width: "34px",
+            height: "34px",
+            borderRadius: "50%",
+            backgroundColor: "#fee2e2",
+            color: "#dc2626",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontWeight: 900,
+            fontSize: "16px"
+          }}>
+            🚨
+          </div>
+          <div style={{ textAlign: "left" }}>
+            <div style={{ fontSize: "12px", fontWeight: 900, color: "#f87171", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+              Incident Case Study
+            </div>
+            <div style={{ fontSize: "11px", color: "#e2e8f0", fontWeight: 600 }}>
+              Student vs Car Blind-Spot Analysis
+            </div>
+          </div>
+        </button>
+      </div>
+
+      {/* Real Incident Analysis Video & Spatial Reconstruction Modal */}
+      <IncidentAnalysisModal
+        isOpen={isIncidentModalOpen}
+        onClose={() => setIsIncidentModalOpen(false)}
       />
     </div>
   );

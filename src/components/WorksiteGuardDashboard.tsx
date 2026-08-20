@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import IncidentAnalysisModal from "@/components/IncidentAnalysisModal";
 import { 
   ShieldAlert, 
   Download, 
@@ -54,6 +55,7 @@ export default function WorksiteGuardDashboard() {
   const [clock, setClock] = useState<string>("");
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [filterLevel, setFilterLevel] = useState<string>("all");
+  const [isIncidentModalOpen, setIsIncidentModalOpen] = useState<boolean>(false);
 
   // Real Camera & Backend state
   const [isWebcamActive, setIsWebcamActive] = useState<boolean>(false);
@@ -620,6 +622,28 @@ export default function WorksiteGuardDashboard() {
             <span>{soundEnabled ? "Audio ON" : "Muted"}</span>
           </button>
 
+          {/* Case Study Incident Button */}
+          <button
+            onClick={() => setIsIncidentModalOpen(true)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              padding: "7px 14px",
+              borderRadius: "8px",
+              backgroundColor: "#fee2e2",
+              color: "#dc2626",
+              fontSize: "12px",
+              fontWeight: 800,
+              border: "1.5px solid #fca5a5",
+              cursor: "pointer",
+              boxShadow: "0 2px 8px rgba(239, 68, 68, 0.2)"
+            }}
+          >
+            <ShieldAlert size={14} />
+            <span>🚨 Incident Case Study</span>
+          </button>
+
           {/* Export Audit Log Button */}
           <button
             onClick={exportAuditLog}
@@ -1088,6 +1112,12 @@ export default function WorksiteGuardDashboard() {
         </div>
 
       </div>
+
+      {/* Real Incident Analysis Video & Spatial Reconstruction Modal */}
+      <IncidentAnalysisModal
+        isOpen={isIncidentModalOpen}
+        onClose={() => setIsIncidentModalOpen(false)}
+      />
     </div>
   );
 }
