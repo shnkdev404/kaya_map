@@ -279,10 +279,10 @@ export default function PhoneBroadcasterPage() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    canvas.width = 320;
-    canvas.height = 240;
-    ctx.drawImage(mediaElem, 0, 0, 320, 240);
-    const b64 = canvas.toDataURL("image/jpeg", 0.55);
+    canvas.width = 240;
+    canvas.height = 180;
+    ctx.drawImage(mediaElem, 0, 0, 240, 180);
+    const b64 = canvas.toDataURL("image/jpeg", 0.4);
     lastFrameB64Ref.current = b64;
   };
 
@@ -336,18 +336,18 @@ export default function PhoneBroadcasterPage() {
   };
 
   const startFrameStreamingLoops = () => {
-    // 1. Dedicated High-Speed Frame Grabber (runs every 200ms)
+    // 1. Dedicated Frame Grabber (runs every 400ms — gives enough time for mobile WiFi round-trip)
     if (frameStreamIntervalRef.current) clearInterval(frameStreamIntervalRef.current);
     frameStreamIntervalRef.current = setInterval(() => {
       grabCurrentCameraFrame();
       sendCurrentPose();
-    }, 200);
+    }, 400);
 
-    // 2. Real-Time AI Detection Loop (runs every 300ms)
+    // 2. Real-Time AI Detection Loop (runs every 500ms)
     if (aiDetectionIntervalRef.current) clearInterval(aiDetectionIntervalRef.current);
     aiDetectionIntervalRef.current = setInterval(() => {
       runRealtimeAiDetection();
-    }, 300);
+    }, 500);
   };
 
   const stopCamera = () => {
@@ -470,11 +470,22 @@ export default function PhoneBroadcasterPage() {
     } catch (e) {}
   };
 
+  // Prevent overlapping HTTP requests from piling up on mobile WiFi
+  const isSendingRef = useRef<boolean>(false);
+  const [lastSendError, setLastSendError] = useState<string | null>(null);
+  const sendSuccessCountRef = useRef<number>(0);
+
   const sendCurrentPose = () => {
+    // Skip if a previous request is still in-flight (prevents mobile WiFi pileup)
+    if (isSendingRef.current) return;
+
     const lat = latestLatRef.current ?? currentLat ?? 23.0225;
     const lon = latestLonRef.current ?? currentLon ?? 72.5714;
 
-    const payload = {
+    // Only include image_b64 if it actually has data
+    const frameData = lastFrameB64Ref.current;
+
+    const payload: any = {
       device_id: deviceId,
       agent_id: deviceId,
       name: deviceId,
@@ -488,7 +499,6 @@ export default function PhoneBroadcasterPage() {
       pitch_deg: latestPitchRef.current,
       roll: latestRollRef.current,
       camera_hfov_deg: 70,
-      image_b64: lastFrameB64Ref.current,
       detections: activeDetectionsRef.current,
       accuracy_m: latestAccuracyRef.current,
       speed_mps: latestSpeedRef.current,
@@ -499,21 +509,29 @@ export default function PhoneBroadcasterPage() {
       online: true
     };
 
+    // Only include image if we have one (avoids null in JSON)
+    if (frameData) {
+      payload.image_b64 = frameData;
+    }
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(payload));
     }
 
+    isSendingRef.current = true;
     const t0 = Date.now();
     fetch("/api/telemetry", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      keepalive: true
+      body: JSON.stringify(payload)
     })
       .then((res) => res.json())
       .then((data) => {
+        isSendingRef.current = false;
         const roundtrip = Date.now() - t0;
         setPingLatency(roundtrip);
+        sendSuccessCountRef.current++;
+        setLastSendError(null);
 
         if (data.blind_spot_alerts && data.blind_spot_alerts.length > 0) {
           setBlindSpotAlerts(data.blind_spot_alerts);
@@ -525,7 +543,11 @@ export default function PhoneBroadcasterPage() {
           setBlindSpotAlerts([]);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        isSendingRef.current = false;
+        setLastSendError(err?.message || "Network error");
+        console.error("[KAYA] sendCurrentPose failed:", err);
+      });
 
     setPacketsSent((p) => p + 1);
   };
@@ -568,6 +590,9 @@ export default function PhoneBroadcasterPage() {
     setStatus("Broadcasting Live Telemetry, Camera & AI Detections...");
     setStatusType("active");
 
+    // Send immediate registration packet so dashboard sees us instantly
+    sendCurrentPose();
+
     startCamera();
 
     try {
@@ -579,9 +604,7 @@ export default function PhoneBroadcasterPage() {
       wsRef.current = ws;
     } catch (e) {}
 
-    streamTickRef.current = setInterval(() => {
-      sendCurrentPose();
-    }, 250);
+    // No need for separate streamTickRef — frameStreamIntervalRef in startFrameStreamingLoops already sends every 400ms
 
     if (isSimulatedWalk) {
       startSimulation();
@@ -1153,6 +1176,25 @@ export default function PhoneBroadcasterPage() {
           }}>
             {status}
           </div>
+
+          {/* Debug: Network Send Status */}
+          {isBroadcasting && (
+            <div style={{
+              padding: "8px 12px",
+              borderRadius: "8px",
+              backgroundColor: lastSendError ? "#fef2f2" : "#f0fdf4",
+              border: `1px solid ${lastSendError ? "#fecaca" : "#bbf7d0"}`,
+              fontSize: "11px",
+              fontFamily: "'JetBrains Mono', monospace",
+              color: lastSendError ? "#991b1b" : "#166534",
+              fontWeight: 600,
+              display: "flex",
+              justifyContent: "space-between"
+            }}>
+              <span>📡 Packets: {packetsSent} | ✅ OK: {sendSuccessCountRef.current} | Ping: {pingLatency}ms</span>
+              {lastSendError && <span style={{ color: "#dc2626" }}>❌ {lastSendError}</span>}
+            </div>
+          )}
 
           {/* SIMULATE THREAT / DETECTIONS ON THIS PHONE */}
           <div style={{
