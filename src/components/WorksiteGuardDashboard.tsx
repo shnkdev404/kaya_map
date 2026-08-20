@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import IncidentAnalysisModal from "@/components/IncidentAnalysisModal";
 import { DeviceTelemetry, ThreatDetection, BlindSpotAlert } from "@/lib/types";
+import { detectObjects } from "@/lib/detector";
 
 interface YoloDetection {
   box: [number, number, number, number];
@@ -349,6 +350,22 @@ export default function WorksiteGuardDashboard() {
         eventSource.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
+
+            if (msg.type === "delete" && msg.device_id) {
+              setActiveTiles((prev) => {
+                const next = new Map(prev);
+                next.delete(msg.device_id);
+                return next;
+              });
+              return;
+            }
+
+            if (msg.type === "clear") {
+              setActiveTiles(new Map());
+              setActiveThreatMatrix([]);
+              return;
+            }
+
             const rawDevices: DeviceTelemetry[] = msg.type === "snapshot" ? (msg.devices || []) : (msg.device ? [msg.device] : []);
             
             if (rawDevices.length > 0) {
@@ -358,7 +375,7 @@ export default function WorksiteGuardDashboard() {
                 const next = new Map(prev);
 
                 rawDevices.forEach((dev) => {
-                  if (dev.type === "station") return;
+                  if (dev.type === "station" || dev.device_id === "station-webcam" || dev.device_id === "local-webcam") return;
 
                   const tileKey = dev.device_id;
                   const existing: LiveCameraTile = next.get(tileKey) || {
@@ -472,16 +489,28 @@ export default function WorksiteGuardDashboard() {
     };
   }, [drawDetections, triggerGlobalBanner]);
 
-  // Real Camera Feed toggler with robust MediaStream handling
+  // Initial cleanup on mount: purge any stale station-webcam from store
+  useEffect(() => {
+    fetch("/api/telemetry?device_id=station-webcam", { method: "DELETE" }).catch(() => {});
+  }, []);
+
+  // Real Camera Feed toggler with direct WebGL AI detection
   const toggleLocalWebcam = async () => {
     if (isWebcamActive) {
-      if (streamIntervalRef.current) clearInterval(streamIntervalRef.current);
+      if (streamIntervalRef.current) {
+        clearInterval(streamIntervalRef.current);
+        streamIntervalRef.current = null;
+      }
       if (webcamStream) {
         webcamStream.getTracks().forEach((track) => track.stop());
         setWebcamStream(null);
       }
       if (webcamVideoRef.current) {
         webcamVideoRef.current.srcObject = null;
+      }
+      if (webcamOverlayCanvasRef.current) {
+        const ctx = webcamOverlayCanvasRef.current.getContext("2d");
+        if (ctx) ctx.clearRect(0, 0, 480, 360);
       }
       setIsWebcamActive(false);
     } else {
@@ -504,35 +533,49 @@ export default function WorksiteGuardDashboard() {
           webcamVideoRef.current.play().catch(() => {});
         }
 
-        // Frame capture loop
-        streamIntervalRef.current = setInterval(() => {
-          if (!webcamVideoRef.current || !captureCanvasRef.current || webcamVideoRef.current.readyState < 2) return;
+        // Run local AI object detection loop on the laptop webcam (every 300ms)
+        streamIntervalRef.current = setInterval(async () => {
+          if (!webcamVideoRef.current || webcamVideoRef.current.readyState < 2) return;
           const video = webcamVideoRef.current;
-          const canvas = captureCanvasRef.current;
-          const ctx = canvas.getContext("2d");
-          if (!ctx) return;
 
-          canvas.width = 480;
-          canvas.height = 360;
-          ctx.drawImage(video, 0, 0, 480, 360);
-          const b64 = canvas.toDataURL("image/jpeg", 0.6);
+          try {
+            const detections = await detectObjects(video, 23.0225, 72.5714, 0, 70);
 
-          fetch("/api/telemetry", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              device_id: "station-webcam",
-              name: "Command Station Webcam",
-              type: "sensor",
-              lat: 23.0225,
-              lon: 72.5714,
-              heading: 0,
-              image_b64: b64,
-              online: true,
-              timestamp: Date.now() / 1000
-            })
-          }).catch(() => {});
-        }, 150);
+            // Draw bounding boxes on local webcam overlay canvas
+            if (webcamOverlayCanvasRef.current) {
+              const canvas = webcamOverlayCanvasRef.current;
+              const ctx = canvas.getContext("2d");
+              if (ctx) {
+                canvas.width = 480;
+                canvas.height = 360;
+                ctx.clearRect(0, 0, 480, 360);
+
+                detections.forEach((det) => {
+                  if (det.bbox) {
+                    const [x, y, bw, bh] = det.bbox;
+                    const isThreat = ["car", "truck", "bus", "motorcycle", "forklift", "threat"].includes(det.class);
+                    const color = isThreat ? "#ef4444" : "#10b981";
+
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 2.5;
+                    ctx.strokeRect(x, y, bw, bh);
+
+                    const label = `${det.class.toUpperCase()} ${Math.round(det.confidence * 100)}% (${det.est_distance_m.toFixed(1)}m)`;
+                    ctx.font = "bold 11px 'JetBrains Mono', monospace";
+                    const tw = ctx.measureText(label).width;
+
+                    ctx.fillStyle = color;
+                    ctx.fillRect(x, Math.max(0, y - 18), tw + 8, 18);
+                    ctx.fillStyle = "#ffffff";
+                    ctx.fillText(label, x + 4, Math.max(14, y - 4));
+                  }
+                });
+              }
+            }
+          } catch (err) {
+            console.warn("Local AI detection error:", err);
+          }
+        }, 300);
       } catch (err: any) {
         console.warn("Local camera error:", err);
         alert("Camera permission blocked or in use. Falling back to synthetic worksite stream.");
@@ -627,7 +670,7 @@ export default function WorksiteGuardDashboard() {
     setActiveBanner(null);
   };
 
-  const tileList = Array.from(activeTiles.values());
+  const tileList = Array.from(activeTiles.values()).filter((t) => t.clientId !== "station-webcam" && t.clientId !== "local-webcam" && t.clientId !== "station");
   const effectiveCameraCount = tileList.length + (isWebcamActive ? 1 : 0);
   const filteredLogs = logs.filter((l) => (filterLevel === "all" ? true : l.level === filterLevel));
 
