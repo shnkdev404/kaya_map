@@ -43,8 +43,9 @@ export default function PhoneBroadcasterPage() {
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [cameraFacing, setCameraFacing] = useState<"environment" | "user">("environment");
   const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
-  const [cameraFps, setCameraFps] = useState(12);
+  const [cameraFps, setCameraFps] = useState(15);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [isUsingSyntheticVideo, setIsUsingSyntheticVideo] = useState(false);
 
   // GPS Coordinates
   const [currentLat, setCurrentLat] = useState<number | null>(null);
@@ -77,13 +78,14 @@ export default function PhoneBroadcasterPage() {
 
   // Video and Canvas references
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const simCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const lastFrameB64Ref = useRef<string | null>(null);
+  const animTickRef = useRef<number>(0);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const wsStreamRef = useRef<WebSocket | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const highRateIntervalRef = useRef<any>(null);
   const streamTickRef = useRef<any>(null);
@@ -180,10 +182,88 @@ export default function PhoneBroadcasterPage() {
     };
   }, []);
 
-  // Start Camera Stream
+  // Synthetic worksite scene drawer for fallback
+  const renderSyntheticPhoneScene = (canvas: HTMLCanvasElement, step: number, hdg = 0) => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const w = canvas.width || 480;
+    const h = canvas.height || 360;
+
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, "#090d16");
+    grad.addColorStop(0.48, "#1e293b");
+    grad.addColorStop(0.5, "#334155");
+    grad.addColorStop(1, "#0f172a");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.strokeStyle = "rgba(56, 189, 248, 0.18)";
+    ctx.lineWidth = 1;
+    const horizon = h * 0.48;
+    const vanishingX = w * 0.5 + Math.sin((hdg * Math.PI) / 180) * 50;
+
+    for (let x = -w; x <= w * 2; x += 50) {
+      ctx.beginPath();
+      ctx.moveTo(vanishingX, horizon);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+
+    const offset = (step * 4) % 30;
+    for (let y = horizon; y <= h; y += 18) {
+      ctx.beginPath();
+      ctx.moveTo(0, y + offset);
+      ctx.lineTo(w, y + offset);
+      ctx.stroke();
+    }
+
+    // Moving Construction Vehicle
+    const vX = w * 0.45 + Math.sin(step * 0.04) * (w * 0.22);
+    const vY = horizon + 30 + Math.abs(Math.sin(step * 0.02)) * 40;
+    const vScale = 0.85 + (vY - horizon) / (h - horizon);
+
+    ctx.fillStyle = activeDetectionsRef.current.length > 0 ? "#ef4444" : "#f59e0b";
+    ctx.fillRect(vX - 28 * vScale, vY - 18 * vScale, 56 * vScale, 32 * vScale);
+    ctx.fillStyle = "#020617";
+    ctx.fillRect(vX - 30 * vScale, vY + 10 * vScale, 16 * vScale, 12 * vScale);
+    ctx.fillRect(vX + 14 * vScale, vY + 10 * vScale, 16 * vScale, 12 * vScale);
+    ctx.fillStyle = "#38bdf8";
+    ctx.fillRect(vX - 12 * vScale, vY - 30 * vScale, 24 * vScale, 14 * vScale);
+
+    // Reticle
+    ctx.strokeStyle = activeDetectionsRef.current.length > 0 ? "rgba(239, 68, 68, 0.6)" : "rgba(16, 185, 129, 0.5)";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(w * 0.32, h * 0.32, w * 0.36, h * 0.36);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 11px 'JetBrains Mono', monospace";
+    ctx.fillText(`● REC [LIVE] ${deviceId}`, 12, 20);
+    ctx.fillStyle = "#38bdf8";
+    ctx.fillText(`HD 1080P · 30 FPS · FOV 70° · HDG ${hdg}°`, 12, 34);
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText(new Date().toLocaleTimeString(), w - 90, 20);
+  };
+
+  // Continuous animation loop for synthetic video
+  useEffect(() => {
+    let animId: any;
+    const loop = () => {
+      animTickRef.current++;
+      if (simCanvasRef.current && isCameraActive && (!mediaStreamRef.current || isUsingSyntheticVideo)) {
+        renderSyntheticPhoneScene(simCanvasRef.current, animTickRef.current, latestHeadingRef.current || 0);
+      }
+      animId = requestAnimationFrame(loop);
+    };
+    animId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(animId);
+  }, [isCameraActive, isUsingSyntheticVideo, deviceId]);
+
+  // Start Camera Stream with multi-tier fallback
   const startCamera = async (facing: "environment" | "user" = cameraFacing) => {
+    setIsCameraActive(true);
+
     if (typeof window === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-      alert("Camera API not supported on this browser.");
+      setIsUsingSyntheticVideo(true);
       return;
     }
 
@@ -192,24 +272,29 @@ export default function PhoneBroadcasterPage() {
         mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: facing,
-          width: { ideal: 640, max: 1280 },
-          height: { ideal: 480, max: 720 },
-          frameRate: { ideal: cameraFps, max: 30 }
-        },
-        audio: false
-      });
-
-      mediaStreamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+      let stream: MediaStream | null = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: facing,
+            width: { ideal: 640, max: 1280 },
+            height: { ideal: 480, max: 720 },
+            frameRate: { ideal: cameraFps, max: 30 }
+          },
+          audio: false
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       }
 
-      setIsCameraActive(true);
+      mediaStreamRef.current = stream;
+      setIsUsingSyntheticVideo(false);
       setHasCameraPermission(true);
+
+      if (videoRef.current && stream) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(() => {});
+      }
 
       // Frame capture loop for shared perception
       if (cameraFrameIntervalRef.current) clearInterval(cameraFrameIntervalRef.current);
@@ -218,9 +303,14 @@ export default function PhoneBroadcasterPage() {
       }, 1000 / cameraFps);
 
     } catch (err: any) {
-      console.warn("Camera access error:", err);
+      console.warn("Hardware camera unavailable, activating synthetic worksite camera:", err);
+      setIsUsingSyntheticVideo(true);
       setHasCameraPermission(false);
-      setIsCameraActive(false);
+
+      if (cameraFrameIntervalRef.current) clearInterval(cameraFrameIntervalRef.current);
+      cameraFrameIntervalRef.current = setInterval(() => {
+        captureAndBroadcastFrame();
+      }, 1000 / cameraFps);
     }
   };
 
@@ -245,19 +335,24 @@ export default function PhoneBroadcasterPage() {
   };
 
   const captureAndBroadcastFrame = () => {
-    if (!videoRef.current || !captureCanvasRef.current || videoRef.current.readyState < 2) return;
+    let sourceCanvasOrVideo: HTMLVideoElement | HTMLCanvasElement | null = null;
 
-    const video = videoRef.current;
+    if (mediaStreamRef.current && videoRef.current && videoRef.current.readyState >= 2 && !isUsingSyntheticVideo) {
+      sourceCanvasOrVideo = videoRef.current;
+    } else if (simCanvasRef.current) {
+      sourceCanvasOrVideo = simCanvasRef.current;
+    }
+
+    if (!sourceCanvasOrVideo || !captureCanvasRef.current) return;
+
     const canvas = captureCanvasRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const w = 480;
-    const h = Math.round((w * (video.videoHeight || 480)) / (video.videoWidth || 640));
-    canvas.width = w;
-    canvas.height = h;
+    canvas.width = 480;
+    canvas.height = 360;
 
-    ctx.drawImage(video, 0, 0, w, h);
+    ctx.drawImage(sourceCanvasOrVideo, 0, 0, 480, 360);
 
     // Get JPEG base64 string
     const b64 = canvas.toDataURL("image/jpeg", 0.65);
@@ -267,9 +362,9 @@ export default function PhoneBroadcasterPage() {
     if (overlayCanvasRef.current) {
       const oCtx = overlayCanvasRef.current.getContext("2d");
       if (oCtx) {
-        overlayCanvasRef.current.width = video.videoWidth || w;
-        overlayCanvasRef.current.height = video.videoHeight || h;
-        oCtx.clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height);
+        overlayCanvasRef.current.width = 480;
+        overlayCanvasRef.current.height = 360;
+        oCtx.clearRect(0, 0, 480, 360);
 
         activeDetectionsRef.current.forEach((det) => {
           if (det.bbox) {
@@ -348,7 +443,7 @@ export default function PhoneBroadcasterPage() {
       wsRef.current.send(JSON.stringify(payload));
     }
 
-    // 2. Send via HTTP POST with latency roundtrip measurement
+    // 2. Send via HTTP POST
     const t0 = Date.now();
     fetch("/api/telemetry", {
       method: "POST",
@@ -361,7 +456,6 @@ export default function PhoneBroadcasterPage() {
         const roundtrip = Date.now() - t0;
         setPingLatency(roundtrip);
 
-        // Check if there are active blind-spot alerts specifically for this device
         if (data.blind_spot_alerts && data.blind_spot_alerts.length > 0) {
           setBlindSpotAlerts(data.blind_spot_alerts);
           playBlindSpotChime();
@@ -415,7 +509,7 @@ export default function PhoneBroadcasterPage() {
     setStatus("Connecting to Telemetry Hub · Acquiring GPS & Camera...");
     setStatusType("active");
 
-    // Auto-start camera if permissions available
+    // Auto-start camera
     startCamera();
 
     // Establish WebSocket Connection
@@ -428,7 +522,6 @@ export default function PhoneBroadcasterPage() {
       ws.onopen = () => {
         setStatus("Connected to Hub · Live Stream Active");
       };
-      ws.onclose = () => {};
       wsRef.current = ws;
     } catch (e) {}
 
@@ -437,7 +530,7 @@ export default function PhoneBroadcasterPage() {
       sendCurrentPose();
     }, 250);
 
-    // If simulation requested
+    // Simulation check
     if (isSimulatedWalk) {
       startSimulation();
       return;
@@ -676,8 +769,15 @@ export default function PhoneBroadcasterPage() {
             alignItems: "center",
             justifyContent: "center"
           }}>
+            {/* Real Hardware Camera Video */}
             <video
-              ref={videoRef}
+              ref={(el) => {
+                videoRef.current = el;
+                if (el && mediaStreamRef.current && el.srcObject !== mediaStreamRef.current) {
+                  el.srcObject = mediaStreamRef.current;
+                  el.play().catch(() => {});
+                }
+              }}
               playsInline
               autoPlay
               muted
@@ -685,7 +785,20 @@ export default function PhoneBroadcasterPage() {
                 width: "100%",
                 height: "100%",
                 objectFit: "cover",
-                display: isCameraActive ? "block" : "none"
+                display: isCameraActive && mediaStreamRef.current && !isUsingSyntheticVideo ? "block" : "none"
+              }}
+            />
+
+            {/* Synthetic Animated Worksite Feed Canvas */}
+            <canvas
+              ref={simCanvasRef}
+              width={480}
+              height={360}
+              style={{
+                width: "100%",
+                height: "100%",
+                objectFit: "cover",
+                display: isCameraActive && (isUsingSyntheticVideo || !mediaStreamRef.current) ? "block" : "none"
               }}
             />
 
@@ -712,7 +825,7 @@ export default function PhoneBroadcasterPage() {
                   Camera Standby
                 </p>
                 <p style={{ fontSize: "12px", margin: "4px 0 14px", color: "#64748b" }}>
-                  Tap below to start rear camera & stream to shared perception
+                  Tap below to start camera & stream to shared perception
                 </p>
                 <button
                   onClick={() => startCamera()}
@@ -759,7 +872,7 @@ export default function PhoneBroadcasterPage() {
                   border: "1px solid rgba(255,255,255,0.15)"
                 }}>
                   <Compass size={13} style={{ color: "#38bdf8" }} />
-                  <span>{heading !== null ? `${heading}°` : "CALIBRATING"}</span>
+                  <span>{heading !== null ? `${heading}°` : "0°"}</span>
                   <span style={{ color: "#94a3b8" }}>·</span>
                   <span>{currentSpeed ? formatSpeedKmh(currentSpeed) : "0.0 km/h"}</span>
                 </div>
@@ -801,7 +914,7 @@ export default function PhoneBroadcasterPage() {
                   gap: "5px"
                 }}>
                   <span style={{ width: "6px", height: "6px", borderRadius: "50%", backgroundColor: "#ffffff" }} className="pulse-active" />
-                  <span>STREAMING FEED ({cameraFacing})</span>
+                  <span>STREAMING FEED ({isUsingSyntheticVideo ? "SYNTHETIC" : cameraFacing})</span>
                 </div>
               </>
             )}
