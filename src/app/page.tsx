@@ -316,7 +316,7 @@ export default function LandingPage() {
               Vision & Threat Detection
             </h3>
             <p style={{ fontSize: "13px", color: "#64748b", lineHeight: 1.5 }}>
-              Automated PPE compliance, proximity hazards, and DPDP privacy face blurring over multi-camera sensor feeds.
+              Real-time YOLO threat identification, multi-camera shared perception, and blind-spot hazard alerts.
             </p>
           </div>
 

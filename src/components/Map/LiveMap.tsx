@@ -39,6 +39,9 @@ export default function LiveMap({
   const markersRef = useRef<Record<string, any>>({});
   const circlesRef = useRef<Record<string, any>>({});
   const polylinesRef = useRef<Record<string, any>>({});
+  const fovLayersRef = useRef<any[]>([]);
+  const threatLayersRef = useRef<any[]>([]);
+  const blindSpotLayersRef = useRef<any[]>([]);
   const geofenceLayersRef = useRef<any[]>([]);
   const drawingLayersRef = useRef<any[]>([]);
   const userInteractedRef = useRef<boolean>(false);
@@ -331,6 +334,114 @@ export default function LiveMap({
         } else if (polylinesRef.current[device.device_id]) {
           map.removeLayer(polylinesRef.current[device.device_id]);
           delete polylinesRef.current[device.device_id];
+        }
+      });
+
+      // =========================================================================
+      // Render Shared Perception FOV Vision Cones & Projected Threats
+      // =========================================================================
+      fovLayersRef.current.forEach((l) => map.removeLayer(l));
+      fovLayersRef.current = [];
+      threatLayersRef.current.forEach((l) => map.removeLayer(l));
+      threatLayersRef.current = [];
+      blindSpotLayersRef.current.forEach((l) => map.removeLayer(l));
+      blindSpotLayersRef.current = [];
+
+      devices.forEach((device) => {
+        const color = device.color || (device.type === "station" ? "#2563eb" : "#059669");
+
+        // 1. Render FOV Vision Cone Polygon
+        if (device.fov_polygon && device.fov_polygon.length >= 3 && device.online) {
+          const fovPoly = L.polygon(device.fov_polygon, {
+            color: color,
+            weight: 1.5,
+            opacity: 0.7,
+            dashArray: "4, 4",
+            fillColor: color,
+            fillOpacity: 0.12,
+            interactive: false
+          }).addTo(map);
+          fovLayersRef.current.push(fovPoly);
+        }
+
+        // 2. Render Projected Threats detected by this device
+        const threats = device.projected_threats || device.detections || [];
+        threats.forEach((t) => {
+          if (t.globalLat && t.globalLon) {
+            const threatPos: [number, number] = [t.globalLat, t.globalLon];
+
+            // Threat Marker Icon
+            const threatIcon = L.divIcon({
+              html: `
+                <div style="
+                  display: flex;
+                  flex-direction: column;
+                  align-items: center;
+                  justify-content: center;
+                  animation: pulse 1.5s infinite;
+                ">
+                  <div style="
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 50%;
+                    background: #fee2e2;
+                    border: 2px solid #ef4444;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    color: #dc2626;
+                    font-size: 14px;
+                    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.4);
+                  ">
+                    ⚠️
+                  </div>
+                  <div style="
+                    background: rgba(15, 23, 42, 0.9);
+                    color: #ffffff;
+                    font-size: 9px;
+                    font-weight: 800;
+                    padding: 1px 5px;
+                    border-radius: 4px;
+                    margin-top: 2px;
+                    white-space: nowrap;
+                    font-family: monospace;
+                  ">
+                    ${t.class || "THREAT"} (${t.est_distance_m ? `${t.est_distance_m}m` : ""})
+                  </div>
+                </div>
+              `,
+              className: "threat-map-marker",
+              iconSize: [40, 48],
+              iconAnchor: [20, 24]
+            });
+
+            const tMarker = L.marker(threatPos, { icon: threatIcon }).addTo(map);
+            threatLayersRef.current.push(tMarker);
+
+            // Tactical Dotted Line from Observer to Threat
+            const observerLine = L.polyline([[device.lat, device.lon], threatPos], {
+              color: "#ef4444",
+              weight: 2,
+              opacity: 0.8,
+              dashArray: "3, 5"
+            }).addTo(map);
+            threatLayersRef.current.push(observerLine);
+          }
+        });
+
+        // 3. Render Blind-Spot Alerts
+        if (device.blind_spot_alerts) {
+          device.blind_spot_alerts.forEach((alert) => {
+            if (alert.threatLat && alert.threatLon) {
+              const blindLine = L.polyline([[device.lat, device.lon], [alert.threatLat, alert.threatLon]], {
+                color: "#e11d48",
+                weight: 3,
+                opacity: 0.9,
+                dashArray: "6, 6"
+              }).addTo(map);
+              blindSpotLayersRef.current.push(blindLine);
+            }
+          });
         }
       });
 

@@ -25,6 +25,7 @@ import {
 
 import { calculateDistanceMeters, calculateSpeedMps, formatSpeedKmh } from "@/lib/geo";
 import { GPSKalmanFilter } from "@/lib/kalman";
+import { ThreatDetection, BlindSpotAlert } from "@/lib/types";
 
 export default function PhoneBroadcasterPage() {
   const [deviceId, setDeviceId] = useState("Phone-" + Math.floor(100 + Math.random() * 900));
@@ -53,6 +54,13 @@ export default function PhoneBroadcasterPage() {
   const [packetsSent, setPacketsSent] = useState(0);
   const [isSecure, setIsSecure] = useState(true);
   const [hostIp, setHostIp] = useState("");
+
+  // Shared Perception & Threat Detection State
+  const [activeDetections, setActiveDetections] = useState<ThreatDetection[]>([]);
+  const [blindSpotAlerts, setBlindSpotAlerts] = useState<BlindSpotAlert[]>([]);
+  const activeDetectionsRef = useRef<ThreatDetection[]>([]);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  useEffect(() => { activeDetectionsRef.current = activeDetections; }, [activeDetections]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const watchIdRef = useRef<number | null>(null);
@@ -173,18 +181,48 @@ export default function PhoneBroadcasterPage() {
     }
   };
 
+  const playBlindSpotChime = () => {
+    try {
+      if (!audioCtxRef.current) {
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        audioCtxRef.current = new AudioCtx();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === "suspended") ctx.resume();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      const now = ctx.currentTime;
+      osc.type = "sawtooth";
+      osc.frequency.setValueAtTime(880, now);
+      osc.frequency.setValueAtTime(659, now + 0.12);
+      osc.frequency.setValueAtTime(880, now + 0.24);
+      gain.gain.setValueAtTime(0.3, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
+      osc.start(now);
+      osc.stop(now + 0.45);
+    } catch (e) {}
+  };
+
   const sendCurrentPose = () => {
     if (latestLatRef.current === null || latestLonRef.current === null) return;
 
     const payload = {
       device_id: deviceId,
+      agent_id: deviceId,
       name: deviceId,
       type: "phone",
       lat: latestLatRef.current,
       lon: latestLonRef.current,
+      altitude: latestAltitudeRef.current,
       heading: latestHeadingRef.current,
+      heading_deg: latestHeadingRef.current,
       pitch: latestPitchRef.current,
+      pitch_deg: latestPitchRef.current,
       roll: latestRollRef.current,
+      camera_hfov_deg: 68,
+      detections: activeDetectionsRef.current,
       accuracy_m: latestAccuracyRef.current,
       speed_mps: latestSpeedRef.current,
       altitude_m: latestAltitudeRef.current,
@@ -208,9 +246,20 @@ export default function PhoneBroadcasterPage() {
       keepalive: true
     })
       .then((res) => res.json())
-      .then(() => {
+      .then((data) => {
         const roundtrip = Date.now() - t0;
         setPingLatency(roundtrip);
+
+        // Check if there are active blind-spot alerts for this device
+        if (data.blind_spot_alerts && data.blind_spot_alerts.length > 0) {
+          setBlindSpotAlerts(data.blind_spot_alerts);
+          playBlindSpotChime();
+          if (typeof navigator !== "undefined" && navigator.vibrate) {
+            navigator.vibrate([200, 100, 200, 100, 300]);
+          }
+        } else {
+          setBlindSpotAlerts([]);
+        }
       })
       .catch(() => {});
 
@@ -481,6 +530,45 @@ export default function PhoneBroadcasterPage() {
             <p style={{ fontSize: "11px", color: "#a16207", margin: 0, lineHeight: 1.5 }}>
               💡 <b>Or</b> just tap <b>Start Live Broadcast</b> below — it will auto-switch to <b>Simulation Mode</b> if GPS is blocked, so you can still test the full system.
             </p>
+          </div>
+        )}
+
+        {/* Active Blind-Spot Hazard Banner on Phone */}
+        {blindSpotAlerts.length > 0 && (
+          <div style={{
+            backgroundColor: "#dc2626",
+            color: "#ffffff",
+            borderRadius: "var(--radius-lg)",
+            padding: "16px 20px",
+            boxShadow: "0 6px 20px rgba(220, 38, 38, 0.4)",
+            animation: "pulse 1.2s infinite",
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px"
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ fontSize: "24px" }}>🚨</span>
+              <div>
+                <strong style={{ fontSize: "14px", letterSpacing: "0.04em", textTransform: "uppercase" }}>
+                  BLIND-SPOT THREAT WARNING!
+                </strong>
+                <p style={{ margin: "2px 0 0 0", fontSize: "12px", opacity: 0.95 }}>
+                  Hazard detected in your blind spot by peer camera mesh
+                </p>
+              </div>
+            </div>
+
+            {blindSpotAlerts.map((alert, idx) => (
+              <div key={idx} style={{
+                backgroundColor: "rgba(0, 0, 0, 0.25)",
+                padding: "8px 12px",
+                borderRadius: "6px",
+                fontSize: "12px",
+                lineHeight: 1.4
+              }}>
+                {alert.message}
+              </div>
+            ))}
           </div>
         )}
 
@@ -833,6 +921,117 @@ export default function PhoneBroadcasterPage() {
               <span style={{ fontWeight: 700, color: "var(--text-main)" }}>
                 {packetsSent} packets
               </span>
+            </div>
+          </div>
+
+          {/* Shared Perception & Threat Broadcaster Panel */}
+          <div style={{
+            backgroundColor: "#ffffff",
+            border: "1px solid var(--border-light)",
+            borderRadius: "var(--radius-md)",
+            padding: "16px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px"
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <ShieldAlert size={16} style={{ color: "#059669" }} />
+                <span style={{ fontSize: "12px", fontWeight: 800, color: "#0f172a" }}>
+                  Shared Perception & Threat Broadcaster
+                </span>
+              </div>
+              <span style={{
+                fontSize: "10px",
+                fontWeight: 700,
+                padding: "2px 6px",
+                borderRadius: "4px",
+                backgroundColor: activeDetections.length > 0 ? "#fee2e2" : "#f0fdf4",
+                color: activeDetections.length > 0 ? "#dc2626" : "#166534"
+              }}>
+                {activeDetections.length} Active Threat{activeDetections.length !== 1 ? "s" : ""}
+              </span>
+            </div>
+
+            <p style={{ fontSize: "11px", color: "var(--text-muted)", margin: 0, lineHeight: 1.4 }}>
+              Broadcast simulated YOLO object detections from this phone to project global threat coordinates and trigger blind-spot warnings to peers.
+            </p>
+
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <button
+                onClick={() => {
+                  const newDet: ThreatDetection = {
+                    class: "threat",
+                    confidence: 0.92,
+                    bearing_deg: 0, // Ahead
+                    est_distance_m: 14.2
+                  };
+                  setActiveDetections([newDet]);
+                  if (isBroadcasting) sendCurrentPose();
+                }}
+                style={{
+                  flex: 1,
+                  minWidth: "130px",
+                  padding: "8px 12px",
+                  borderRadius: "6px",
+                  backgroundColor: activeDetections.some(d => d.class === "threat") ? "#fef2f2" : "#ffffff",
+                  border: activeDetections.some(d => d.class === "threat") ? "1.5px solid #ef4444" : "1px solid var(--border-light)",
+                  color: activeDetections.some(d => d.class === "threat") ? "#dc2626" : "var(--text-main)",
+                  fontSize: "11px",
+                  fontWeight: 700,
+                  cursor: "pointer"
+                }}
+              >
+                🚨 Spot Threat Ahead (14m)
+              </button>
+
+              <button
+                onClick={() => {
+                  const newDet: ThreatDetection = {
+                    class: "forklift",
+                    confidence: 0.96,
+                    bearing_deg: 15, // 15 deg to the right
+                    est_distance_m: 8.5
+                  };
+                  setActiveDetections([newDet]);
+                  if (isBroadcasting) sendCurrentPose();
+                }}
+                style={{
+                  flex: 1,
+                  minWidth: "130px",
+                  padding: "8px 12px",
+                  borderRadius: "6px",
+                  backgroundColor: activeDetections.some(d => d.class === "forklift") ? "#fffbeb" : "#ffffff",
+                  border: activeDetections.some(d => d.class === "forklift") ? "1.5px solid #d97706" : "1px solid var(--border-light)",
+                  color: activeDetections.some(d => d.class === "forklift") ? "#b45309" : "var(--text-main)",
+                  fontSize: "11px",
+                  fontWeight: 700,
+                  cursor: "pointer"
+                }}
+              >
+                🚜 Spot Forklift (8.5m)
+              </button>
+
+              {activeDetections.length > 0 && (
+                <button
+                  onClick={() => {
+                    setActiveDetections([]);
+                    if (isBroadcasting) sendCurrentPose();
+                  }}
+                  style={{
+                    padding: "8px 12px",
+                    borderRadius: "6px",
+                    backgroundColor: "#f8fafc",
+                    border: "1px solid var(--border-light)",
+                    color: "var(--text-secondary)",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    cursor: "pointer"
+                  }}
+                >
+                  Clear
+                </button>
+              )}
             </div>
           </div>
         </div>

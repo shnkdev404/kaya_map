@@ -2,7 +2,8 @@ import { NextResponse } from "next/server";
 import {
   broadcastTelemetryUpdate,
   getTelemetryStore,
-  setTelemetryDevice,
+  getActiveBlindSpotAlerts,
+  processTelemetryPacket,
   removeTelemetryDevice,
   clearAllTelemetry
 } from "@/lib/telemetryStore";
@@ -11,34 +12,42 @@ export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
   try {
-    const data = await request.json();
-    const device_id = data.device_id || "unknown";
+    const rawData = await request.json();
+    
+    // Process packet through shared perception & blind-spot engine
+    const { device, blindSpotAlerts } = processTelemetryPacket(rawData);
 
-    const payload = {
-      ...data,
-      device_id,
-      server_time: Date.now() / 1000
-    };
+    // Instantly notify all SSE listeners (<3ms)
+    broadcastTelemetryUpdate({ 
+      type: "update", 
+      device, 
+      blind_spot_alerts: blindSpotAlerts,
+      timestamp: Date.now() 
+    });
 
-    setTelemetryDevice(device_id, payload);
-
-    // Instantly notify all SSE listeners (<5ms)
-    broadcastTelemetryUpdate({ type: "update", device: payload, timestamp: Date.now() });
+    // Check if there is an alert specifically targeted at this device
+    const targetAlerts = blindSpotAlerts.filter(a => a.targetAgentId === device.device_id);
 
     return NextResponse.json({
       status: "ok",
-      device_id,
-      latency_ms: data.client_time ? Date.now() - data.client_time : 0
+      device_id: device.device_id,
+      agent_id: device.device_id,
+      fov_points: device.fov_polygon?.length || 0,
+      active_threats: device.projected_threats?.length || 0,
+      blind_spot_alerts: targetAlerts,
+      all_site_alerts_count: blindSpotAlerts.length,
+      latency_ms: rawData.timestamp ? Math.max(0, Date.now() - rawData.timestamp) : 0
     });
   } catch (error) {
-    return NextResponse.json({ status: "error", message: "Invalid payload" }, { status: 400 });
+    return NextResponse.json({ status: "error", message: "Invalid telemetry payload" }, { status: 400 });
   }
 }
 
 export async function GET() {
   return NextResponse.json({
     status: "ok",
-    devices: Object.values(getTelemetryStore())
+    devices: Object.values(getTelemetryStore()),
+    blind_spot_alerts: getActiveBlindSpotAlerts()
   });
 }
 
@@ -56,7 +65,7 @@ export async function DELETE(request: Request) {
   if (clear === "dummy" || clear === "stale") {
     const store = getTelemetryStore();
     Object.keys(store).forEach((id) => {
-      if (id.startsWith("sim-") || store[id]?.simulated) {
+      if (id.startsWith("sim-") || (store[id] as any)?.simulated) {
         removeTelemetryDevice(id);
       }
     });

@@ -17,6 +17,9 @@
 # misc
 .DS_Store
 *.pem
+*.pt
+*.onnx
+*.engine
 
 # debug
 npm-debug.log*

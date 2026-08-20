@@ -6,7 +6,7 @@ import Sidebar from "@/components/Sidebar";
 import SimulatorModal from "@/components/Dashboard/SimulatorModal";
 import GeofenceModal from "@/components/Dashboard/GeofenceModal";
 import StationCalibrateModal from "@/components/Dashboard/StationCalibrateModal";
-import { DeviceTelemetry, SimulationProfile, GeofenceZone, GeofenceAlert } from "@/lib/types";
+import { DeviceTelemetry, SimulationProfile, GeofenceZone, GeofenceAlert, BlindSpotAlert } from "@/lib/types";
 import { 
   calculateDistanceMeters, 
   formatDistance, 
@@ -102,6 +102,7 @@ export default function GeofenceDashboardPage() {
   const [isDrawingWaypoints, setIsDrawingWaypoints] = useState(false);
   const [drawingWaypoints, setDrawingWaypoints] = useState<[number, number][]>([]);
   const [geofenceAlerts, setGeofenceAlerts] = useState<GeofenceAlert[]>([]);
+  const [blindSpotAlerts, setBlindSpotAlerts] = useState<BlindSpotAlert[]>([]);
   const previousContainmentRef = useRef<Record<string, Record<string, boolean>>>({});
 
   // Simulator State
@@ -319,6 +320,10 @@ export default function GeofenceDashboardPage() {
               });
             } else if (msg.type === "update" && msg.device) {
               const d = applyDeviceKalman(msg.device as DeviceTelemetry);
+
+              if (msg.blind_spot_alerts) {
+                setBlindSpotAlerts(msg.blind_spot_alerts);
+              }
 
               // Auto-sync laptop base station to phone satellite GPS on first connection if not custom calibrated
               if (!isCustomStationCalibratedRef.current && !hasAutoSyncedPhoneRef.current && (d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster") && (d.accuracy_m || 20) <= 15) {
@@ -654,6 +659,56 @@ export default function GeofenceDashboardPage() {
             </div>
           </div>
         </div>
+
+        {/* Blind-Spot Threat Detection Banner */}
+        {blindSpotAlerts.length > 0 && (
+          <div style={{
+            backgroundColor: "#fff1f2",
+            border: "1.5px solid #ef4444",
+            borderRadius: "12px",
+            padding: "12px 18px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            animation: "pulse 1.4s infinite",
+            boxShadow: "0 4px 14px rgba(239, 68, 68, 0.15)"
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+              <div style={{
+                width: "36px",
+                height: "36px",
+                borderRadius: "50%",
+                backgroundColor: "#fee2e2",
+                color: "#dc2626",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontWeight: 900,
+                fontSize: "16px"
+              }}>
+                🚨
+              </div>
+              <div>
+                <span style={{ fontSize: "13px", fontWeight: 900, color: "#9f1239", textTransform: "uppercase", letterSpacing: "0.03em" }}>
+                  Active Blind-Spot Hazard Detected ({blindSpotAlerts.length})
+                </span>
+                <p style={{ fontSize: "12px", color: "#b91c1c", margin: "2px 0 0 0", fontWeight: 600 }}>
+                  {blindSpotAlerts[0].message}
+                </p>
+              </div>
+            </div>
+            <span style={{
+              fontSize: "11px",
+              fontWeight: 800,
+              backgroundColor: "#fee2e2",
+              color: "#991b1b",
+              padding: "4px 8px",
+              borderRadius: "6px"
+            }}>
+              Target: {blindSpotAlerts[0].targetAgentId}
+            </span>
+          </div>
+        )}
 
         {/* Breach Alert Banner */}
         {geofenceAlerts.length > 0 && (
