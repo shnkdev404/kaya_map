@@ -540,8 +540,11 @@ export default function WorksiteGuardDashboard() {
     }
   };
 
+  const [isSimulatingDemo, setIsSimulatingDemo] = useState<boolean>(false);
+
   // 1-Click Multi-Phone Shared Perception Simulation Demo
   const triggerMultiPhoneDemo = async () => {
+    setIsSimulatingDemo(true);
     // Generate synthetic frames for both phones
     const simCanvasA = document.createElement("canvas");
     simCanvasA.width = 480;
@@ -608,6 +611,20 @@ export default function WorksiteGuardDashboard() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(phoneB)
     });
+  };
+
+  const stopMultiPhoneDemo = async () => {
+    setIsSimulatingDemo(false);
+    await fetch("/api/telemetry?device_id=Phone-Alpha", { method: "DELETE" }).catch(() => {});
+    await fetch("/api/telemetry?device_id=Phone-Bravo", { method: "DELETE" }).catch(() => {});
+    setActiveTiles((prev) => {
+      const next = new Map(prev);
+      next.delete("Phone-Alpha");
+      next.delete("Phone-Bravo");
+      return next;
+    });
+    setActiveThreatMatrix([]);
+    setActiveBanner(null);
   };
 
   const tileList = Array.from(activeTiles.values());
@@ -732,27 +749,50 @@ export default function WorksiteGuardDashboard() {
 
         {/* Quick Actions */}
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-          {/* Multi-Phone Demo Trigger */}
-          <button
-            onClick={triggerMultiPhoneDemo}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              padding: "7px 14px",
-              borderRadius: "8px",
-              backgroundColor: "#fff1f2",
-              color: "#e11d48",
-              border: "1.5px solid #fecdd3",
-              fontSize: "12px",
-              fontWeight: 800,
-              cursor: "pointer",
-              boxShadow: "0 2px 8px rgba(225, 29, 72, 0.15)"
-            }}
-          >
-            <Sparkles size={14} />
-            <span>Simulate Multi-Phone Threat Demo</span>
-          </button>
+          {/* Multi-Phone Demo Trigger / Stop Button */}
+          {isSimulatingDemo ? (
+            <button
+              onClick={stopMultiPhoneDemo}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "7px 14px",
+                borderRadius: "8px",
+                backgroundColor: "#dc2626",
+                color: "#ffffff",
+                border: "none",
+                fontSize: "12px",
+                fontWeight: 800,
+                cursor: "pointer",
+                boxShadow: "0 2px 10px rgba(220, 38, 38, 0.35)"
+              }}
+            >
+              <RotateCcw size={14} />
+              <span>Stop Simulation & Clear Feeds</span>
+            </button>
+          ) : (
+            <button
+              onClick={triggerMultiPhoneDemo}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "7px 14px",
+                borderRadius: "8px",
+                backgroundColor: "#fff1f2",
+                color: "#e11d48",
+                border: "1.5px solid #fecdd3",
+                fontSize: "12px",
+                fontWeight: 800,
+                cursor: "pointer",
+                boxShadow: "0 2px 8px rgba(225, 29, 72, 0.15)"
+              }}
+            >
+              <Sparkles size={14} />
+              <span>Simulate Multi-Phone Threat Demo</span>
+            </button>
+          )}
 
           {/* Real WebCam Toggler */}
           <button

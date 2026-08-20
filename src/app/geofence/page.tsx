@@ -54,7 +54,8 @@ import {
   SlidersHorizontal,
   Navigation,
   Cpu,
-  Maximize2
+  Maximize2,
+  Square
 } from "lucide-react";
 import Link from "next/link";
 
@@ -677,6 +678,55 @@ export default function GeofenceDashboardPage() {
             </div>
           </div>
         </div>
+
+        {/* Active Simulation Notice & Stop Button */}
+        {isSimulating && (
+          <div style={{
+            backgroundColor: "#ecfdf5",
+            border: "1.5px solid var(--emerald-primary)",
+            borderRadius: "12px",
+            padding: "10px 18px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            boxShadow: "0 2px 10px rgba(5, 150, 105, 0.15)"
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <div style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: "var(--emerald-primary)" }} className="pulse-active" />
+              <div>
+                <strong style={{ fontSize: "13px", color: "var(--emerald-dark)" }}>
+                  Virtual Simulation Engine Active ({simProfiles.length} Nodes Running)
+                </strong>
+                <p style={{ fontSize: "11px", color: "#065f46", margin: "2px 0 0 0" }}>
+                  Generating live GPS orbits, patrol patterns, and velocity vectors.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => {
+                setIsSimulating(false);
+                setDevices((prev) => prev.filter((d) => !d.device_id.startsWith("sim-")));
+              }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "7px 14px",
+                borderRadius: "8px",
+                backgroundColor: "#ef4444",
+                color: "#ffffff",
+                border: "none",
+                fontSize: "12px",
+                fontWeight: 700,
+                cursor: "pointer",
+                boxShadow: "0 2px 6px rgba(239, 68, 68, 0.3)"
+              }}
+            >
+              <Square size={13} />
+              <span>Stop Simulation</span>
+            </button>
+          </div>
+        )}
 
         {/* Blind-Spot Threat Detection Banner */}
         {blindSpotAlerts.length > 0 && (
