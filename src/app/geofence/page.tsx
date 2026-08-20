@@ -210,6 +210,32 @@ export default function GeofenceDashboardPage() {
     setIsPinpointingStation(false);
   };
 
+  const handleRefreshServerGps = () => {
+    if (typeof window === "undefined" || !navigator.geolocation) {
+      if (!laptopLocation) {
+        syncServerStation(23.0225, 72.5714, 15, null, "Default Base Station");
+      }
+      return;
+    }
+    setIsRefreshingGps(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setIsRefreshingGps(false);
+        const c = pos.coords;
+        syncServerStation(c.latitude, c.longitude, c.accuracy || 8, c.altitude, "Laptop Live GPS");
+        setFocusCoords([c.latitude, c.longitude]);
+      },
+      (err) => {
+        setIsRefreshingGps(false);
+        console.warn("Laptop GPS lookup notice:", err.message);
+        if (!laptopLocation) {
+          syncServerStation(23.0225, 72.5714, 20, null, "Default Base Station");
+        }
+      },
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 }
+    );
+  };
+
   const handleResetToAutoGps = () => {
     isCustomStationCalibratedRef.current = false;
     if (typeof window !== "undefined") {
@@ -223,32 +249,36 @@ export default function GeofenceDashboardPage() {
       setHostUrl(window.location.host);
 
       // Check if user has previously calibrated base station
+      let hasSaved = false;
       try {
         const saved = localStorage.getItem("kaya_custom_station");
         if (saved) {
           const parsed = JSON.parse(saved);
           if (parsed.lat && parsed.lon) {
+            hasSaved = true;
             isCustomStationCalibratedRef.current = true;
             syncServerStation(parsed.lat, parsed.lon, parsed.accuracy || 1.5, parsed.altitude || null, parsed.label || "Calibrated Base Station");
           }
         }
       } catch (e) {}
 
-      // Browser GPS Watch (only if high-accuracy fix is reported by hardware)
+      // If no saved custom station, immediately query laptop browser GPS
+      if (!hasSaved) {
+        handleRefreshServerGps();
+      }
+
+      // Browser GPS Watch to continuously track laptop position
       if (navigator.geolocation) {
         const watchId = navigator.geolocation.watchPosition(
           (pos) => {
             if (isCustomStationCalibratedRef.current) return;
             const c = pos.coords;
-            // Only update station if accuracy is reasonable (<= 30m)
-            if (c.accuracy && c.accuracy <= 30) {
-              syncServerStation(c.latitude, c.longitude, c.accuracy, c.altitude, "Live GPS Fix");
-            }
+            syncServerStation(c.latitude, c.longitude, c.accuracy || 8, c.altitude, "Live GPS Fix");
           },
           (err) => {
-            console.warn("Server GPS notice:", err.message);
+            console.warn("Server GPS watch notice:", err.message);
           },
-          { enableHighAccuracy: true, timeout: 10000, maximumAge: 3000 }
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 }
         );
         laptopWatchIdRef.current = watchId;
       }
@@ -276,13 +306,6 @@ export default function GeofenceDashboardPage() {
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === "snapshot" && Array.isArray(msg.devices)) {
-              // Auto-sync laptop base station to phone satellite GPS if not custom calibrated
-              const phone = msg.devices.find((x: any) => (x.type === "phone" || x.device_id.startsWith("phone") || x.device_id === "phone-broadcaster") && (x.accuracy_m || 20) <= 15);
-              if (phone && !isCustomStationCalibratedRef.current && !hasAutoSyncedPhoneRef.current) {
-                hasAutoSyncedPhoneRef.current = true;
-                syncServerStation(phone.lat, phone.lon, Math.min(phone.accuracy_m || 2, 2.5), phone.altitude_m || null, "Auto-Synced from Phone GNSS");
-              }
-
               setDevices((prev) => {
                 const prevMap = new Map(prev.map((d) => [d.device_id, d]));
                 const merged: DeviceTelemetry[] = msg.devices.map((rawDev: DeviceTelemetry) => {
@@ -295,9 +318,21 @@ export default function GeofenceDashboardPage() {
                   return { ...d, history };
                 });
 
-                if (isLaptopStationActive && !msg.devices.some((d: any) => d.device_id === "station-laptop")) {
-                  const localStation = prev.find((p) => p.device_id === "station-laptop");
-                  if (localStation) merged.unshift(localStation);
+                if (isLaptopStationActive && laptopLocation && !merged.some((d: any) => d.device_id === "station-laptop")) {
+                  merged.unshift({
+                    device_id: "station-laptop",
+                    name: "Command Station (Laptop / Server)",
+                    type: "station",
+                    lat: laptopLocation.lat,
+                    lon: laptopLocation.lon,
+                    accuracy_m: laptopLocation.accuracy || 5,
+                    speed_mps: 0,
+                    altitude_m: laptopLocation.altitude || 0,
+                    timestamp: Date.now() / 1000,
+                    online: true,
+                    color: "#2563eb",
+                    history: [{ lat: laptopLocation.lat, lon: laptopLocation.lon, timestamp: Date.now() / 1000 }]
+                  });
                 }
                 return merged;
               });
@@ -306,11 +341,6 @@ export default function GeofenceDashboardPage() {
 
               if (msg.blind_spot_alerts) {
                 setBlindSpotAlerts(msg.blind_spot_alerts);
-              }
-
-              // Auto-align laptop base station to phone satellite GPS if not custom calibrated
-              if (!isCustomStationCalibratedRef.current && (d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster") && (d.accuracy_m || 20) <= 20) {
-                syncServerStation(d.lat, d.lon, Math.min(d.accuracy_m || 2, 2.5), d.altitude_m || null, "Aligned with Phone GPS");
               }
 
               setDevices((prev) => {
@@ -323,6 +353,24 @@ export default function GeofenceDashboardPage() {
 
                 const updatedDev = { ...d, history };
                 map.set(d.device_id, updatedDev);
+
+                // Ensure station is maintained
+                if (isLaptopStationActive && laptopLocation && !map.has("station-laptop")) {
+                  map.set("station-laptop", {
+                    device_id: "station-laptop",
+                    name: "Command Station (Laptop / Server)",
+                    type: "station",
+                    lat: laptopLocation.lat,
+                    lon: laptopLocation.lon,
+                    accuracy_m: laptopLocation.accuracy || 5,
+                    speed_mps: 0,
+                    altitude_m: laptopLocation.altitude || 0,
+                    timestamp: Date.now() / 1000,
+                    online: true,
+                    color: "#2563eb",
+                    history: [{ lat: laptopLocation.lat, lon: laptopLocation.lon, timestamp: Date.now() / 1000 }]
+                  });
+                }
 
                 // Update selected device reference if active
                 setSelectedDevice((curr) => (curr?.device_id === d.device_id ? updatedDev : curr));
@@ -452,25 +500,6 @@ export default function GeofenceDashboardPage() {
   const handleFocusDevice = (device: DeviceTelemetry) => {
     setSelectedDevice(device);
     setFocusCoords([device.lat, device.lon]);
-  };
-
-  const handleRefreshServerGps = () => {
-    setIsRefreshingGps(true);
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          setIsRefreshingGps(false);
-          const c = pos.coords;
-          syncServerStation(c.latitude, c.longitude, c.accuracy || 5, c.altitude, "Fresh Browser GPS Fix");
-        },
-        () => {
-          setIsRefreshingGps(false);
-        },
-        { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
-      );
-    } else {
-      setIsRefreshingGps(false);
-    }
   };
 
   const filteredDevices = devices.filter((d) => {
