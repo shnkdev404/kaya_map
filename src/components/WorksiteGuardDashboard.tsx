@@ -343,6 +343,102 @@ export default function WorksiteGuardDashboard() {
     let eventSource: EventSource | null = null;
     let reconnectTimer: any = null;
 
+    // Process incoming raw devices from SSE or HTTP polling
+    const ingestDevices = (rawDevices: DeviceTelemetry[], blindSpotAlerts?: BlindSpotAlert[]) => {
+      if (!rawDevices || rawDevices.length === 0) return;
+
+      const allDetections: YoloDetection[] = [];
+
+      setActiveTiles((prev) => {
+        const next = new Map(prev);
+
+        rawDevices.forEach((dev) => {
+          if (dev.type === "station" || dev.device_id === "station-webcam" || dev.device_id === "local-webcam") return;
+
+          const tileKey = dev.device_id || dev.agent_id;
+          if (!tileKey) return;
+
+          const existing: LiveCameraTile = next.get(tileKey) || {
+            clientId: tileKey,
+            name: dev.name || dev.device_id || tileKey,
+            imageSrc: undefined,
+            detections: [],
+            threats: [],
+            threatLevel: "safe",
+            lastFrameTime: Date.now(),
+            frameWidth: 640,
+            frameHeight: 480
+          };
+
+          if (dev.image_b64) {
+            existing.imageSrc = dev.image_b64.startsWith("data:") ? dev.image_b64 : `data:image/jpeg;base64,${dev.image_b64}`;
+          }
+
+          existing.lat = dev.lat;
+          existing.lon = dev.lon;
+          existing.heading = dev.heading_deg ?? dev.heading ?? 0;
+          existing.speed_mps = dev.speed_mps || 0;
+          existing.accuracy_m = dev.accuracy_m || 2.5;
+          existing.lastFrameTime = Date.now();
+
+          // Map detections
+          const mappedDets: YoloDetection[] = (dev.detections || []).map((d: any) => {
+            const [x, y, w, h] = d.bbox || [60, 80, 260, 200];
+            const detObj: YoloDetection = {
+              box: [x, y, x + w, y + h],
+              class_name: d.class || "threat",
+              confidence: d.confidence || 0.94,
+              threat_level: d.is_blind_spot ? "danger" : "caution",
+              bearing_deg: d.bearing_deg,
+              est_distance_m: d.est_distance_m || 14.5,
+              globalLat: d.globalLat,
+              globalLon: d.globalLon,
+              trajectory_mps: d.trajectory_mps || 4.5,
+              trajectory_heading: d.trajectory_heading,
+              source_device_id: dev.device_id,
+              threat_to_target_id: d.threat_to_target_id,
+              threat_to_target_name: d.threat_to_target_name,
+              is_blind_spot: d.is_blind_spot
+            };
+            allDetections.push(detObj);
+            return detObj;
+          });
+
+          existing.detections = mappedDets;
+          existing.threatLevel = mappedDets.some((d) => d.is_blind_spot || d.threat_level === "danger") ? "danger" : (mappedDets.length > 0 ? "caution" : "safe");
+
+          next.set(tileKey, existing);
+
+          // Draw detections on overlay canvas
+          drawDetections(
+            tileCanvasRefs.current[tileKey] || null,
+            existing.detections,
+            existing.threats,
+            existing.frameWidth || 640,
+            existing.frameHeight || 480
+          );
+        });
+
+        return next;
+      });
+
+      if (allDetections.length > 0) {
+        setActiveThreatMatrix(allDetections);
+      }
+
+      // Check alerts
+      if (blindSpotAlerts && blindSpotAlerts.length > 0) {
+        const firstAlert: BlindSpotAlert = blindSpotAlerts[0];
+        triggerGlobalBanner(
+          "danger",
+          `BLIND-SPOT THREAT DISPATCHED [${firstAlert.sourceAgentId} -> ${firstAlert.targetAgentId}]`,
+          firstAlert.message,
+          firstAlert.sourceAgentId,
+          firstAlert.targetAgentId
+        );
+      }
+    };
+
     const connectSSE = () => {
       try {
         eventSource = new EventSource("/api/telemetry/stream");
@@ -367,110 +463,7 @@ export default function WorksiteGuardDashboard() {
             }
 
             const rawDevices: DeviceTelemetry[] = msg.type === "snapshot" ? (msg.devices || []) : (msg.device ? [msg.device] : []);
-            
-            if (rawDevices.length > 0) {
-              const allDetections: YoloDetection[] = [];
-
-              setActiveTiles((prev) => {
-                const next = new Map(prev);
-
-                rawDevices.forEach((dev) => {
-                  if (dev.type === "station" || dev.device_id === "station-webcam" || dev.device_id === "local-webcam") return;
-
-                  const tileKey = dev.device_id;
-                  const existing: LiveCameraTile = next.get(tileKey) || {
-                    clientId: dev.device_id,
-                    name: dev.name || dev.device_id,
-                    imageSrc: undefined,
-                    detections: [],
-                    threats: [],
-                    threatLevel: "safe",
-                    lastFrameTime: Date.now(),
-                    frameWidth: 640,
-                    frameHeight: 480
-                  };
-
-                  if (dev.image_b64) {
-                    existing.imageSrc = dev.image_b64.startsWith("data:") ? dev.image_b64 : `data:image/jpeg;base64,${dev.image_b64}`;
-                  }
-
-                  existing.lat = dev.lat;
-                  existing.lon = dev.lon;
-                  existing.heading = dev.heading_deg ?? dev.heading ?? 0;
-                  existing.speed_mps = dev.speed_mps || 0;
-                  existing.accuracy_m = dev.accuracy_m || 2.5;
-                  existing.lastFrameTime = Date.now();
-
-                  // Map detections
-                  const mappedDets: YoloDetection[] = (dev.detections || []).map((d: any) => {
-                    const [x, y, w, h] = d.bbox || [60, 80, 260, 200];
-                    const detObj: YoloDetection = {
-                      box: [x, y, x + w, y + h],
-                      class_name: d.class || "threat",
-                      confidence: d.confidence || 0.94,
-                      threat_level: d.is_blind_spot ? "danger" : "caution",
-                      bearing_deg: d.bearing_deg,
-                      est_distance_m: d.est_distance_m || 14.5,
-                      globalLat: d.globalLat,
-                      globalLon: d.globalLon,
-                      trajectory_mps: d.trajectory_mps || 4.5,
-                      trajectory_heading: d.trajectory_heading,
-                      source_device_id: dev.device_id,
-                      threat_to_target_id: d.threat_to_target_id,
-                      threat_to_target_name: d.threat_to_target_name,
-                      is_blind_spot: d.is_blind_spot
-                    };
-                    allDetections.push(detObj);
-                    return detObj;
-                  });
-
-                  existing.detections = mappedDets;
-                  existing.threatLevel = mappedDets.some((d) => d.is_blind_spot || d.threat_level === "danger") ? "danger" : (mappedDets.length > 0 ? "caution" : "safe");
-
-                  next.set(tileKey, existing);
-
-                  // Draw detections on overlay canvas
-                  drawDetections(
-                    tileCanvasRefs.current[tileKey] || null,
-                    existing.detections,
-                    existing.threats,
-                    existing.frameWidth || 640,
-                    existing.frameHeight || 480
-                  );
-                });
-
-                return next;
-              });
-
-              setActiveThreatMatrix(allDetections);
-
-              // Check alerts
-              if (msg.blind_spot_alerts && msg.blind_spot_alerts.length > 0) {
-                const firstAlert: BlindSpotAlert = msg.blind_spot_alerts[0];
-                triggerGlobalBanner(
-                  "danger",
-                  `BLIND-SPOT THREAT DISPATCHED [${firstAlert.sourceAgentId} -> ${firstAlert.targetAgentId}]`,
-                  firstAlert.message,
-                  firstAlert.sourceAgentId,
-                  firstAlert.targetAgentId
-                );
-
-                setLogs((prev) => [
-                  {
-                    id: firstAlert.id,
-                    timeString: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-                    clientId: firstAlert.sourceAgentId,
-                    level: "danger",
-                    label: `Blind-Spot Hazard (${firstAlert.threatClass})`,
-                    message: firstAlert.message,
-                    threatTo: firstAlert.targetAgentId,
-                    coordinates: `${firstAlert.threatLat.toFixed(5)}°, ${firstAlert.threatLon.toFixed(5)}°`,
-                    trajectory: `${firstAlert.distanceToTargetM}m @ ${firstAlert.bearingFromTargetDeg}°`
-                  },
-                  ...prev.slice(0, 50)
-                ]);
-              }
-            }
+            ingestDevices(rawDevices, msg.blind_spot_alerts);
           } catch {}
         };
 
@@ -483,9 +476,22 @@ export default function WorksiteGuardDashboard() {
 
     connectSSE();
 
+    // Fast Active HTTP Poll Fallback (every 500ms) to ensure continuous video feeds from phones
+    const pollInterval = setInterval(() => {
+      fetch("/api/telemetry")
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.devices) {
+            ingestDevices(data.devices, data.blind_spot_alerts);
+          }
+        })
+        .catch(() => {});
+    }, 500);
+
     return () => {
       if (eventSource) eventSource.close();
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      clearInterval(pollInterval);
     };
   }, [drawDetections, triggerGlobalBanner]);
 

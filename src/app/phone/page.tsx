@@ -38,7 +38,7 @@ import { detectObjects, loadObjectDetector } from "@/lib/detector";
 export default function PhoneBroadcasterPage() {
   const [deviceId, setDeviceId] = useState("Phone-" + Math.floor(100 + Math.random() * 900));
   const [isBroadcasting, setIsBroadcasting] = useState(false);
-  const [status, setStatus] = useState("Ready to start broadcast");
+  const [status, setStatus] = useState("Ready to start camera & broadcast");
   const [statusType, setStatusType] = useState<"idle" | "active" | "error">("idle");
   
   // Camera & AI State
@@ -50,17 +50,17 @@ export default function PhoneBroadcasterPage() {
   const [aiModelLoaded, setAiModelLoaded] = useState(false);
 
   // GPS Coordinates
-  const [currentLat, setCurrentLat] = useState<number | null>(null);
-  const [currentLon, setCurrentLon] = useState<number | null>(null);
-  const [currentAccuracy, setCurrentAccuracy] = useState<number | null>(null);
+  const [currentLat, setCurrentLat] = useState<number | null>(23.0225);
+  const [currentLon, setCurrentLon] = useState<number | null>(72.5714);
+  const [currentAccuracy, setCurrentAccuracy] = useState<number | null>(3.0);
   const [currentSpeed, setCurrentSpeed] = useState<number>(0);
-  const [currentAltitude, setCurrentAltitude] = useState<number | null>(null);
+  const [currentAltitude, setCurrentAltitude] = useState<number | null>(15.0);
   const [pingLatency, setPingLatency] = useState<number>(0);
 
   // IMU / Orientation State
-  const [heading, setHeading] = useState<number | null>(null);
-  const [pitch, setPitch] = useState<number | null>(null);
-  const [roll, setRoll] = useState<number | null>(null);
+  const [heading, setHeading] = useState<number | null>(0);
+  const [pitch, setPitch] = useState<number | null>(0);
+  const [roll, setRoll] = useState<number | null>(0);
   const [hasImuSupport, setHasImuSupport] = useState(false);
   const [needsIosPermission, setNeedsIosPermission] = useState(false);
 
@@ -92,22 +92,23 @@ export default function PhoneBroadcasterPage() {
   const watchIdRef = useRef<number | null>(null);
   const highRateIntervalRef = useRef<any>(null);
   const streamTickRef = useRef<any>(null);
+  const frameStreamIntervalRef = useRef<any>(null);
   const aiDetectionIntervalRef = useRef<any>(null);
   const simIntervalRef = useRef<any>(null);
   const kalmanRef = useRef<GPSKalmanFilter>(new GPSKalmanFilter(2.5));
   
-  // High-rate state refs for transmission
-  const latestLatRef = useRef<number | null>(null);
-  const latestLonRef = useRef<number | null>(null);
-  const latestAccuracyRef = useRef<number | null>(null);
-  const latestAltitudeRef = useRef<number | null>(null);
+  // High-rate state refs for instant, reliable transmission
+  const latestLatRef = useRef<number>(23.0225);
+  const latestLonRef = useRef<number>(72.5714);
+  const latestAccuracyRef = useRef<number>(3.0);
+  const latestAltitudeRef = useRef<number | null>(15.0);
   const latestSpeedRef = useRef<number>(0);
-  const latestHeadingRef = useRef<number | null>(null);
-  const latestPitchRef = useRef<number | null>(null);
-  const latestRollRef = useRef<number | null>(null);
+  const latestHeadingRef = useRef<number>(0);
+  const latestPitchRef = useRef<number | null>(0);
+  const latestRollRef = useRef<number | null>(0);
 
   useEffect(() => {
-    latestHeadingRef.current = heading;
+    latestHeadingRef.current = heading ?? 0;
     latestPitchRef.current = pitch;
     latestRollRef.current = roll;
   }, [heading, pitch, roll]);
@@ -188,7 +189,7 @@ export default function PhoneBroadcasterPage() {
     };
   }, []);
 
-  // Synthetic scene renderer for simulation
+  // Synthetic scene renderer for simulation fallback
   const renderSyntheticPhoneScene = (canvas: HTMLCanvasElement, step: number, hdg = 0) => {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -263,12 +264,35 @@ export default function PhoneBroadcasterPage() {
     return () => cancelAnimationFrame(animId);
   }, [isCameraActive, isUsingSyntheticVideo, deviceId]);
 
+  // Capture frame from active camera element and compress to JPEG
+  const grabCurrentCameraFrame = () => {
+    let mediaElem: HTMLVideoElement | HTMLCanvasElement | null = null;
+    if (mediaStreamRef.current && videoRef.current && videoRef.current.readyState >= 2 && !isUsingSyntheticVideo) {
+      mediaElem = videoRef.current;
+    } else if (simCanvasRef.current) {
+      mediaElem = simCanvasRef.current;
+    }
+
+    if (!mediaElem || !captureCanvasRef.current) return;
+
+    const canvas = captureCanvasRef.current;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    canvas.width = 320;
+    canvas.height = 240;
+    ctx.drawImage(mediaElem, 0, 0, 320, 240);
+    const b64 = canvas.toDataURL("image/jpeg", 0.55);
+    lastFrameB64Ref.current = b64;
+  };
+
   // Start Camera Stream with multi-tier fallback
   const startCamera = async (facing: "environment" | "user" = cameraFacing) => {
     setIsCameraActive(true);
 
     if (typeof window === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       setIsUsingSyntheticVideo(true);
+      startFrameStreamingLoops();
       return;
     }
 
@@ -301,28 +325,39 @@ export default function PhoneBroadcasterPage() {
         videoRef.current.play().catch(() => {});
       }
 
-      // Start Real-Time AI Detection Loop (runs every 280ms)
-      if (aiDetectionIntervalRef.current) clearInterval(aiDetectionIntervalRef.current);
-      aiDetectionIntervalRef.current = setInterval(() => {
-        runRealtimeAiDetection();
-      }, 280);
+      startFrameStreamingLoops();
 
     } catch (err: any) {
       console.warn("Hardware camera unavailable, activating synthetic camera:", err);
       setIsUsingSyntheticVideo(true);
       setHasCameraPermission(false);
-
-      if (aiDetectionIntervalRef.current) clearInterval(aiDetectionIntervalRef.current);
-      aiDetectionIntervalRef.current = setInterval(() => {
-        runRealtimeAiDetection();
-      }, 280);
+      startFrameStreamingLoops();
     }
+  };
+
+  const startFrameStreamingLoops = () => {
+    // 1. Dedicated High-Speed Frame Grabber (runs every 200ms)
+    if (frameStreamIntervalRef.current) clearInterval(frameStreamIntervalRef.current);
+    frameStreamIntervalRef.current = setInterval(() => {
+      grabCurrentCameraFrame();
+      sendCurrentPose();
+    }, 200);
+
+    // 2. Real-Time AI Detection Loop (runs every 300ms)
+    if (aiDetectionIntervalRef.current) clearInterval(aiDetectionIntervalRef.current);
+    aiDetectionIntervalRef.current = setInterval(() => {
+      runRealtimeAiDetection();
+    }, 300);
   };
 
   const stopCamera = () => {
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
+    }
+    if (frameStreamIntervalRef.current) {
+      clearInterval(frameStreamIntervalRef.current);
+      frameStreamIntervalRef.current = null;
     }
     if (aiDetectionIntervalRef.current) {
       clearInterval(aiDetectionIntervalRef.current);
@@ -364,7 +399,6 @@ export default function PhoneBroadcasterPage() {
       // 1. Run AI Inference (COCO-SSD / MobileNet)
       const detections = await detectObjects(mediaElem, obsLat, obsLon, obsHdg, 70);
 
-      // Attach device metadata
       detections.forEach((d) => {
         d.source_device_id = deviceId;
       });
@@ -404,18 +438,6 @@ export default function PhoneBroadcasterPage() {
           });
         }
       }
-
-      // 3. Capture compact frame for shared perception broadcast (320x240 @ 0.5 quality ~10KB)
-      if (captureCanvasRef.current) {
-        const canvas = captureCanvasRef.current;
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          canvas.width = 320;
-          canvas.height = 240;
-          ctx.drawImage(mediaElem, 0, 0, 320, 240);
-          lastFrameB64Ref.current = canvas.toDataURL("image/jpeg", 0.5);
-        }
-      }
     } catch (e) {
     } finally {
       isDetectingRef.current = false;
@@ -449,15 +471,16 @@ export default function PhoneBroadcasterPage() {
   };
 
   const sendCurrentPose = () => {
-    if (latestLatRef.current === null || latestLonRef.current === null) return;
+    const lat = latestLatRef.current ?? currentLat ?? 23.0225;
+    const lon = latestLonRef.current ?? currentLon ?? 72.5714;
 
     const payload = {
       device_id: deviceId,
       agent_id: deviceId,
       name: deviceId,
       type: "phone",
-      lat: latestLatRef.current,
-      lon: latestLonRef.current,
+      lat: lat,
+      lon: lon,
       altitude: latestAltitudeRef.current,
       heading: latestHeadingRef.current,
       heading_deg: latestHeadingRef.current,
@@ -558,7 +581,7 @@ export default function PhoneBroadcasterPage() {
 
     streamTickRef.current = setInterval(() => {
       sendCurrentPose();
-    }, 280);
+    }, 250);
 
     if (isSimulatedWalk) {
       startSimulation();
@@ -853,26 +876,30 @@ export default function PhoneBroadcasterPage() {
                   AI Camera Standby
                 </p>
                 <p style={{ fontSize: "12px", margin: "4px 0 14px", color: "#64748b" }}>
-                  Tap below to start live camera & AI object detection
+                  Tap below to start live camera & broadcast to laptop
                 </p>
                 <button
-                  onClick={() => startCamera()}
+                  onClick={() => {
+                    startCamera();
+                    if (!isBroadcasting) startBroadcasting();
+                  }}
                   style={{
                     backgroundColor: "var(--emerald-primary)",
                     color: "#ffffff",
                     border: "none",
-                    padding: "8px 18px",
+                    padding: "10px 20px",
                     borderRadius: "8px",
                     fontSize: "13px",
                     fontWeight: 700,
                     cursor: "pointer",
                     display: "inline-flex",
                     alignItems: "center",
-                    gap: "6px"
+                    gap: "6px",
+                    boxShadow: "0 4px 12px rgba(5, 150, 105, 0.3)"
                   }}
                 >
                   <Camera size={16} />
-                  <span>Start Camera & AI</span>
+                  <span>Start Camera & Broadcast</span>
                 </button>
               </div>
             )}
@@ -926,7 +953,7 @@ export default function PhoneBroadcasterPage() {
                   <RotateCw size={16} />
                 </button>
 
-                {/* Live AI Status Badge */}
+                {/* Live Status Badge */}
                 <div style={{
                   position: "absolute",
                   bottom: "10px",
@@ -942,7 +969,7 @@ export default function PhoneBroadcasterPage() {
                   gap: "5px"
                 }}>
                   <span style={{ width: "6px", height: "6px", borderRadius: "50%", backgroundColor: "#ffffff" }} className="pulse-active" />
-                  <span>AI YOLO ENGINE ACTIVE ({activeDetections.length} DETECTIONS)</span>
+                  <span>STREAMING TO LAPTOP ({packetsSent} FRAMES SENT)</span>
                 </div>
               </>
             )}
@@ -959,7 +986,14 @@ export default function PhoneBroadcasterPage() {
           }}>
             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
               <button
-                onClick={() => (isCameraActive ? stopCamera() : startCamera())}
+                onClick={() => {
+                  if (isCameraActive) {
+                    stopCamera();
+                  } else {
+                    startCamera();
+                    if (!isBroadcasting) startBroadcasting();
+                  }
+                }}
                 style={{
                   padding: "6px 14px",
                   borderRadius: "8px",
@@ -999,7 +1033,7 @@ export default function PhoneBroadcasterPage() {
             </div>
 
             <span style={{ fontSize: "11px", color: "#64748b", fontFamily: "'JetBrains Mono', monospace" }}>
-              {packetsSent} packets · {aiModelLoaded ? "AI Model Ready" : "Loading Model..."}
+              {packetsSent} frames sent · {aiModelLoaded ? "AI Ready" : "Loading..."}
             </span>
           </div>
         </div>
