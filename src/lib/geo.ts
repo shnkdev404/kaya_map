@@ -339,6 +339,7 @@ export function checkBlindSpotThreats(
     const sourceHeading = sourceAgent.heading_deg ?? sourceAgent.heading ?? 0;
 
     for (const det of sourceDetections) {
+      det.source_device_id = sourceId;
       let threatLat = det.globalLat;
       let threatLon = det.globalLon;
 
@@ -351,7 +352,12 @@ export function checkBlindSpotThreats(
         );
         threatLat = pLat;
         threatLon = pLon;
+        det.globalLat = pLat;
+        det.globalLon = pLon;
       }
+
+      det.trajectory_heading = Math.round(calculateBearing(sourceAgent.lat, sourceAgent.lon, threatLat, threatLon));
+      det.trajectory_mps = det.trajectory_mps || 4.2;
 
       // Check all peer agents
       for (const targetAgent of activeAgents) {
@@ -385,6 +391,10 @@ export function checkBlindSpotThreats(
             threatLon
           );
           const relPos = determineRelativePosition(targetHeading, bearingFromTarget);
+
+          det.threat_to_target_id = targetId;
+          det.threat_to_target_name = targetAgent.name || targetId;
+          det.is_blind_spot = true;
 
           const alertItem: BlindSpotAlert = {
             id: `bs-${sourceId}-${targetId}-${Date.now()}`,

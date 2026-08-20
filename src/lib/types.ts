@@ -10,13 +10,21 @@ export interface LocationPoint {
 }
 
 export interface ThreatDetection {
+  id?: string;
   class: string;
-  bbox?: [number, number, number, number]; // [x, y, w, h]
+  bbox?: [number, number, number, number]; // [x, y, w, h] or [x1, y1, x2, y2]
   confidence: number;
-  bearing_deg: number; // absolute bearing (or relative to agent heading)
+  bearing_deg: number; // absolute bearing
+  bearing_offset_deg?: number; // relative pixel offset bearing
   est_distance_m: number;
   globalLat?: number;
   globalLon?: number;
+  trajectory_mps?: number;
+  trajectory_heading?: number;
+  source_device_id?: string;
+  threat_to_target_id?: string;
+  threat_to_target_name?: string;
+  is_blind_spot?: boolean;
 }
 
 export interface BlindSpotAlert {
@@ -45,7 +53,7 @@ export interface DeviceTelemetry {
   pitch?: number | null;
   pitch_deg?: number | null;
   roll?: number | null;
-  camera_hfov_deg?: number | null; // e.g. 68 degrees
+  camera_hfov_deg?: number | null; // e.g. 70 degrees
   accuracy_m?: number | null;
   speed_mps?: number | null;
   altitude_m?: number | null;
@@ -54,6 +62,8 @@ export interface DeviceTelemetry {
   server_time?: number;
   online: boolean;
   color?: string;
+  image_b64?: string;
+  image_url?: string;
   history?: LocationPoint[];
   detections?: ThreatDetection[];
   fov_polygon?: [number, number][]; // Computed FOV vision cone polygon
@@ -80,20 +90,23 @@ export interface GeofenceZone {
   type?: GeofenceType; // 'circle' | 'polygon'
   center: [number, number]; // [lat, lon]
   radiusMeters: number;
-  waypoints?: [number, number][]; // [lat, lon] array for multi-waypoint perimeter
-  alertOnEnter: boolean;
-  alertOnExit: boolean;
+  waypoints?: [number, number][]; // For polygon geofences
   color: string;
+  alertOnExit: boolean;
+  alertOnEnter: boolean;
   enabled: boolean;
 }
 
 export interface GeofenceAlert {
   id: string;
-  deviceId: string;
-  deviceName: string;
   zoneId: string;
   zoneName: string;
-  type: 'entered' | 'exited';
-  distance: number;
+  deviceId: string;
+  deviceName?: string;
+  type: 'breach_exit' | 'breach_enter' | 'entered' | 'exited' | string;
   timestamp: number;
+  lat?: number;
+  lon?: number;
+  distance?: number;
+  message?: string;
 }
