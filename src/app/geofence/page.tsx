@@ -133,11 +133,17 @@ export default function GeofenceDashboardPage() {
   const kalmanFiltersMapRef = useRef<Map<string, GPSKalmanFilter>>(new Map());
 
   const applyDeviceKalman = (d: DeviceTelemetry): DeviceTelemetry => {
+    // If device is already sending high-precision GPS (from phone or RTK), preserve exact coordinates
+    if (d.accuracy_m && d.accuracy_m <= 10) {
+      return d;
+    }
+
     if (!kalmanFiltersMapRef.current.has(d.device_id)) {
       kalmanFiltersMapRef.current.set(d.device_id, new GPSKalmanFilter(2.5));
     }
     const kf = kalmanFiltersMapRef.current.get(d.device_id)!;
-    const kState = kf.update(d.lat, d.lon, d.accuracy_m || 5, d.timestamp || Date.now() / 1000, d.altitude_m || 0);
+    const tsSec = d.timestamp ? (d.timestamp > 1e11 ? d.timestamp / 1000 : d.timestamp) : Date.now() / 1000;
+    const kState = kf.update(d.lat, d.lon, d.accuracy_m || 5, tsSec, d.altitude_m || 0);
     const finalSpeed = (d.speed_mps !== undefined && d.speed_mps !== null && d.speed_mps > 0) ? d.speed_mps : kState.speedMps;
 
     return {
@@ -152,15 +158,9 @@ export default function GeofenceDashboardPage() {
 
   // Sync Server Station device and broadcast position
   const syncServerStation = (rawLat: number, rawLon: number, accuracy: number, altitude: number | null, label?: string) => {
-    if (!kalmanFiltersMapRef.current.has("station-laptop")) {
-      kalmanFiltersMapRef.current.set("station-laptop", new GPSKalmanFilter(1.5));
-    }
-    const kf = kalmanFiltersMapRef.current.get("station-laptop")!;
-    const kState = kf.update(rawLat, rawLon, accuracy, Date.now() / 1000, altitude || 0);
-
-    const lat = kState.lat;
-    const lon = kState.lon;
-    const loc = { lat, lon, accuracy: kState.accuracy, altitude: kState.alt, label };
+    const lat = rawLat;
+    const lon = rawLon;
+    const loc = { lat, lon, accuracy, altitude, label };
     setLaptopLocation(loc);
 
     const stationDevice: DeviceTelemetry = {
@@ -169,9 +169,9 @@ export default function GeofenceDashboardPage() {
       type: "station",
       lat,
       lon,
-      accuracy_m: kState.accuracy,
-      speed_mps: kState.speedMps,
-      altitude_m: kState.alt,
+      accuracy_m: accuracy,
+      speed_mps: 0,
+      altitude_m: altitude || 0,
       timestamp: Date.now() / 1000,
       online: true,
       color: "#2563eb",
@@ -234,35 +234,16 @@ export default function GeofenceDashboardPage() {
         }
       } catch (e) {}
 
-      // 1. Fast IP-based resolution for instant origin coordinates
-      const fetchFastIp = async () => {
-        if (isCustomStationCalibratedRef.current) return;
-        try {
-          const res = await fetch("https://ipwho.is/");
-          const data = await res.json();
-          if (!isCustomStationCalibratedRef.current && data && data.latitude && data.longitude) {
-            syncServerStation(data.latitude, data.longitude, 500, null, `${data.city || ""}, ${data.region || ""}`);
-          }
-        } catch (e) {
-          try {
-            const res2 = await fetch("https://ipapi.co/json/");
-            const data2 = await res2.json();
-            if (!isCustomStationCalibratedRef.current && data2 && data2.latitude && data2.longitude) {
-              syncServerStation(data2.latitude, data2.longitude, 500, null, `${data2.city || ""}, ${data2.region || ""}`);
-            }
-          } catch (e2) {}
-        }
-      };
-
-      fetchFastIp();
-
-      // 2. High-accuracy Browser GPS Watch
+      // Browser GPS Watch (only if high-accuracy fix is reported by hardware)
       if (navigator.geolocation) {
         const watchId = navigator.geolocation.watchPosition(
           (pos) => {
             if (isCustomStationCalibratedRef.current) return;
             const c = pos.coords;
-            syncServerStation(c.latitude, c.longitude, c.accuracy || 8, c.altitude, "Live GPS Fix");
+            // Only update station if accuracy is reasonable (<= 30m)
+            if (c.accuracy && c.accuracy <= 30) {
+              syncServerStation(c.latitude, c.longitude, c.accuracy, c.altitude, "Live GPS Fix");
+            }
           },
           (err) => {
             console.warn("Server GPS notice:", err.message);
@@ -327,10 +308,9 @@ export default function GeofenceDashboardPage() {
                 setBlindSpotAlerts(msg.blind_spot_alerts);
               }
 
-              // Auto-sync laptop base station to phone satellite GPS on first connection if not custom calibrated
-              if (!isCustomStationCalibratedRef.current && !hasAutoSyncedPhoneRef.current && (d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster") && (d.accuracy_m || 20) <= 15) {
-                hasAutoSyncedPhoneRef.current = true;
-                syncServerStation(d.lat, d.lon, Math.min(d.accuracy_m || 2, 2.5), d.altitude_m || null, "Auto-Synced from Phone GNSS");
+              // Auto-align laptop base station to phone satellite GPS if not custom calibrated
+              if (!isCustomStationCalibratedRef.current && (d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster") && (d.accuracy_m || 20) <= 20) {
+                syncServerStation(d.lat, d.lon, Math.min(d.accuracy_m || 2, 2.5), d.altitude_m || null, "Aligned with Phone GPS");
               }
 
               setDevices((prev) => {
@@ -382,10 +362,17 @@ export default function GeofenceDashboardPage() {
         const res = await fetch("/api/telemetry");
         if (res.ok) {
           const data = await res.json();
-          if (Array.isArray(data)) {
+          const deviceList: DeviceTelemetry[] = Array.isArray(data) ? data : (data.devices || []);
+          if (deviceList.length > 0) {
+            // Auto-align station if uncalibrated
+            const phone = deviceList.find((x) => (x.type === "phone" || x.device_id.startsWith("phone") || x.device_id === "phone-broadcaster") && (x.accuracy_m || 20) <= 20);
+            if (phone && !isCustomStationCalibratedRef.current && (!laptopLocation || laptopLocation.accuracy > 25)) {
+              syncServerStation(phone.lat, phone.lon, Math.min(phone.accuracy_m || 2, 2.5), phone.altitude_m || null, "Aligned with Phone GPS");
+            }
+
             setDevices((prev) => {
               const prevMap = new Map(prev.map((d) => [d.device_id, d]));
-              const merged: DeviceTelemetry[] = data.map((rawDev: DeviceTelemetry) => {
+              const merged: DeviceTelemetry[] = deviceList.map((rawDev: DeviceTelemetry) => {
                 const d = applyDeviceKalman(rawDev);
                 const existing = prevMap.get(d.device_id);
                 const prevHist = existing?.history || [];
@@ -395,7 +382,7 @@ export default function GeofenceDashboardPage() {
                 return { ...d, history };
               });
 
-              if (isLaptopStationActive && !data.some((d: any) => d.device_id === "station-laptop")) {
+              if (isLaptopStationActive && !deviceList.some((d: any) => d.device_id === "station-laptop")) {
                 const localStation = prev.find((p) => p.device_id === "station-laptop");
                 if (localStation) merged.unshift(localStation);
               }

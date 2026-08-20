@@ -187,6 +187,15 @@ export default function LiveMap({
         }
       });
 
+      // Auto-center map on active device if initial center not set
+      if (!initialCenterSetRef.current && !userInteractedRef.current && devices.length > 0) {
+        const primary = devices.find((d) => d.type === "phone" || d.device_id.startsWith("phone") || d.device_id === "phone-broadcaster") || devices[0];
+        if (primary && primary.lat && primary.lon) {
+          initialCenterSetRef.current = true;
+          map.setView([primary.lat, primary.lon], 17);
+        }
+      }
+
       devices.forEach((device) => {
         const pos: [number, number] = [device.lat, device.lon];
         const isStation = device.type === "station";
