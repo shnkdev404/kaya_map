@@ -152,6 +152,10 @@ export function formatArea(sqMeters: number): string {
  * SHARED PERCEPTION & BLIND-SPOT GEOMETRY ENGINE
  * ========================================================================= */
 
+export function normalizeAngle(angleDeg: number): number {
+  return ((angleDeg + 180) % 360 + 360) % 360 - 180;
+}
+
 /**
  * Projects a geographic point given an origin [lat, lon], bearing in degrees, and distance in meters.
  * Uses local ENU (equirectangular projection) for sub-millimeter precision at worksite scale.
@@ -195,6 +199,28 @@ export function calculateBearing(
 }
 
 /**
+ * Direct FOV Trigonometry Check:
+ * Given a device with (lat, lon, heading), tests whether a threat (threatLat, threatLon)
+ * is within maxRangeM (e.g. 40m) BUT OUTSIDE the device's FOV angle (e.g. 70°).
+ */
+export function isOutsideFov(
+  deviceLat: number,
+  deviceLon: number,
+  deviceHeadingDeg: number,
+  threatLat: number,
+  threatLon: number,
+  fovDeg = 70,
+  maxRangeM = 40
+): boolean {
+  const bearing = calculateBearing(deviceLat, deviceLon, threatLat, threatLon);
+  const distance = calculateDistanceMeters(deviceLat, deviceLon, threatLat, threatLon);
+  if (distance > maxRangeM) return false; // too far to matter
+
+  const angleDiff = Math.abs(normalizeAngle(bearing - deviceHeadingDeg));
+  return angleDiff > (fovDeg / 2);
+}
+
+/**
  * Computes the FOV (Field of View) vision cone polygon for an agent.
  * Given lat, lon, heading, HFOV (horizontal field of view), and range (e.g. 50m),
  * generates a pie-slice polygon centered at the agent.
@@ -203,7 +229,7 @@ export function calculateFovPolygon(
   lat: number,
   lon: number,
   headingDeg: number,
-  hfovDeg = 68,
+  hfovDeg = 70,
   visibilityRangeMeters = 50,
   numArcPoints = 16
 ): [number, number][] {
@@ -224,6 +250,38 @@ export function calculateFovPolygon(
 }
 
 /**
+ * Converts bbox center horizontal pixel offset into angle offset from heading and estimates threat location.
+ */
+export function estimateThreatFromPixelOffset(
+  obsLat: number,
+  obsLon: number,
+  obsHeadingDeg: number,
+  bboxCenterX: number,
+  frameWidth: number,
+  fovDeg = 70,
+  distanceEstM = 14
+): {
+  threatLat: number;
+  threatLon: number;
+  bearingOffsetDeg: number;
+  effectiveBearingDeg: number;
+  distanceEstM: number;
+} {
+  const pixelOffset = bboxCenterX - (frameWidth / 2);
+  const bearingOffsetDeg = (pixelOffset / frameWidth) * fovDeg;
+  const effectiveBearingDeg = ((obsHeadingDeg + bearingOffsetDeg) % 360 + 360) % 360;
+  const [threatLat, threatLon] = projectCoordinates(obsLat, obsLon, effectiveBearingDeg, distanceEstM);
+
+  return {
+    threatLat,
+    threatLon,
+    bearingOffsetDeg: Math.round(bearingOffsetDeg * 10) / 10,
+    effectiveBearingDeg: Math.round(effectiveBearingDeg * 10) / 10,
+    distanceEstM
+  };
+}
+
+/**
  * Projects a local YOLO threat detection (with bearing and estimated distance) to a global [lat, lon].
  */
 export function projectThreatToGlobal(
@@ -232,7 +290,6 @@ export function projectThreatToGlobal(
   agentHeadingDeg: number,
   detection: ThreatDetection
 ): [number, number] {
-  // If bearing is relative (-90° to +90°), add to agent heading; if absolute, use directly
   const effectiveBearing = (detection.bearing_deg !== undefined)
     ? ((agentHeadingDeg + detection.bearing_deg) % 360 + 360) % 360
     : agentHeadingDeg;
@@ -241,7 +298,7 @@ export function projectThreatToGlobal(
     agentLat,
     agentLon,
     effectiveBearing,
-    detection.est_distance_m || 10
+    detection.est_distance_m || 14
   );
 }
 
@@ -266,12 +323,13 @@ export function determineRelativePosition(
 
 /**
  * Core Shared Perception & Blind-Spot Engine:
- * For every detected threat from any agent, tests against all peer agents' FOV polygons.
- * If threat is in proximity of Agent B, but outside Agent B's FOV polygon -> Fires targeted Blind-Spot Alert!
+ * For every detected threat from any agent, tests against all peer agents' FOV cones.
+ * If threat is within 40m of Agent B, but outside Agent B's 70° FOV cone -> Fires targeted Blind-Spot Alert!
  */
 export function checkBlindSpotThreats(
   activeAgents: DeviceTelemetry[],
-  maxAlertDistanceM = 60
+  maxAlertDistanceM = 40,
+  fovDeg = 70
 ): BlindSpotAlert[] {
   const alerts: BlindSpotAlert[] = [];
 
@@ -281,7 +339,6 @@ export function checkBlindSpotThreats(
     const sourceHeading = sourceAgent.heading_deg ?? sourceAgent.heading ?? 0;
 
     for (const det of sourceDetections) {
-      // Calculate or read global coordinate of threat
       let threatLat = det.globalLat;
       let threatLon = det.globalLon;
 
@@ -302,52 +359,48 @@ export function checkBlindSpotThreats(
         if (targetId === sourceId) continue; // Don't alert self
 
         const targetHeading = targetAgent.heading_deg ?? targetAgent.heading ?? 0;
-        const targetFov = targetAgent.fov_polygon || calculateFovPolygon(
+
+        // Core 30-line FOV check
+        const outsideFov = isOutsideFov(
           targetAgent.lat,
           targetAgent.lon,
           targetHeading,
-          targetAgent.camera_hfov_deg || 68,
-          50
-        );
-
-        const distToTarget = calculateDistanceMeters(
-          targetAgent.lat,
-          targetAgent.lon,
           threatLat,
-          threatLon
+          threatLon,
+          targetAgent.camera_hfov_deg || fovDeg,
+          maxAlertDistanceM
         );
 
-        // If threat is within proximity range of target agent
-        if (distToTarget <= maxAlertDistanceM) {
-          // Check if threat is inside target agent's FOV
-          const insideTargetFov = isPointInPolygon([threatLat, threatLon], targetFov);
+        if (outsideFov) {
+          const distToTarget = calculateDistanceMeters(
+            targetAgent.lat,
+            targetAgent.lon,
+            threatLat,
+            threatLon
+          );
+          const bearingFromTarget = calculateBearing(
+            targetAgent.lat,
+            targetAgent.lon,
+            threatLat,
+            threatLon
+          );
+          const relPos = determineRelativePosition(targetHeading, bearingFromTarget);
 
-          // If threat is OUTSIDE target's FOV -> Target cannot see it! (Blind-spot threat)
-          if (!insideTargetFov) {
-            const bearingFromTarget = calculateBearing(
-              targetAgent.lat,
-              targetAgent.lon,
-              threatLat,
-              threatLon
-            );
-            const relPos = determineRelativePosition(targetHeading, bearingFromTarget);
+          const alertItem: BlindSpotAlert = {
+            id: `bs-${sourceId}-${targetId}-${Date.now()}`,
+            targetAgentId: targetId,
+            sourceAgentId: sourceId,
+            threatClass: det.class || 'threat',
+            threatLat,
+            threatLon,
+            distanceToTargetM: Math.round(distToTarget * 10) / 10,
+            bearingFromTargetDeg: Math.round(bearingFromTarget),
+            relativePosition: relPos,
+            message: `⚠️ Blind-spot ${det.class || 'hazard'} approaching ${relPos.replace('_', ' ')} (${Math.round(distToTarget)}m away), spotted by ${sourceAgent.name || sourceId}!`,
+            timestamp: Date.now()
+          };
 
-            const alertItem: BlindSpotAlert = {
-              id: `bs-${sourceId}-${targetId}-${Date.now()}`,
-              targetAgentId: targetId,
-              sourceAgentId: sourceId,
-              threatClass: det.class || 'threat',
-              threatLat,
-              threatLon,
-              distanceToTargetM: Math.round(distToTarget * 10) / 10,
-              bearingFromTargetDeg: Math.round(bearingFromTarget),
-              relativePosition: relPos,
-              message: `⚠️ Blind-spot ${det.class || 'hazard'} approaching ${relPos.replace('_', ' ')} (${Math.round(distToTarget)}m away), spotted by ${sourceAgent.name || sourceId}!`,
-              timestamp: Date.now()
-            };
-
-            alerts.push(alertItem);
-          }
+          alerts.push(alertItem);
         }
       }
     }

@@ -1,10 +1,13 @@
-"""WorksiteGuard server.
+"""WorksiteGuard server with Shared Perception & Blind-Spot Threat Engine.
 
-Run (HTTPS is required so phone browsers allow camera access):
-    uvicorn main:app --host 0.0.0.0 --port 8000 \
-        --ssl-keyfile ../key.pem --ssl-certfile ../cert.pem
-
-See README.md for generating key.pem / cert.pem.
+Features:
+1. Real-time Multi-Camera YOLO Stream Relay
+2. In-memory pose store for all connected agents (lat, lon, heading)
+3. 3-Second TTL active threat cache
+4. 70° FOV & Haversine Blind-Spot checking:
+   "When Phone A detects a threat, project threat (lat, lon); check every other connected
+    Phone B. If threat is within 40m but OUTSIDE Phone B's FOV cone -> Push targeted alert
+    specifically to Phone B's socket."
 """
 from __future__ import annotations
 
@@ -24,7 +27,13 @@ from fastapi.staticfiles import StaticFiles
 
 from config import settings
 from detector import Detector
-from threat_engine import ThreatEngine
+from threat_engine import (
+    ThreatEngine, 
+    estimate_threat_coordinates, 
+    is_outside_fov, 
+    calc_bearing, 
+    haversine
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("worksite_guard.main")
@@ -39,7 +48,8 @@ threat_engine = ThreatEngine()
 executor = ThreadPoolExecutor(max_workers=4)
 
 dashboards: set[WebSocket] = set()
-clients: dict[str, dict] = {}  # client_id -> {"last_seen": ts}
+# clients: client_id -> {"lat": float, "lon": float, "heading": float, "last_seen": float}
+clients: dict[str, dict] = {}
 client_sockets: dict[str, WebSocket] = {}
 raw_frame_store: dict[str, bytes] = {}
 detection_tasks: dict[str, asyncio.Task] = {}
@@ -59,18 +69,24 @@ async def client_page():
 
 @app.get("/api/clients")
 async def list_clients():
-    return {cid: {"last_seen": v["last_seen"]} for cid, v in clients.items()}
+    return {
+        cid: {
+            "lat": v.get("lat"),
+            "lon": v.get("lon"),
+            "heading": v.get("heading"),
+            "last_seen": v.get("last_seen")
+        } 
+        for cid, v in clients.items()
+    }
 
 
 @app.get("/api/site-perception")
 async def site_perception_api():
-    all_threats = [
-        {"source_client_id": cid, "level": t["level"], "label": t["label"], "message": t["message"]}
-        for cid, t_list in active_threats_by_client.items()
-        for t in t_list
-    ]
+    threat_engine.purge_expired_threats()
+    all_threats = list(threat_engine.threats.values())
     return {
         "clients": list(clients.keys()),
+        "devices": clients,
         "active_threats": all_threats,
         "summary": _build_site_summary(),
         "ts": time.time(),
@@ -90,6 +106,17 @@ async def _broadcast(message: dict) -> None:
             dead.append(ws)
     for ws in dead:
         dashboards.discard(ws)
+
+
+async def _send_targeted_alert(target_client_id: str, alert_message: dict) -> None:
+    """Sends a targeted blind-spot alert directly to the socket of the affected device only."""
+    ws = client_sockets.get(target_client_id)
+    if ws:
+        try:
+            await ws.send_text(json.dumps(alert_message))
+            logger.info("🚨 TARGETED BLIND-SPOT ALERT SENT TO [%s]: %s", target_client_id, alert_message.get("message"))
+        except Exception:
+            client_sockets.pop(target_client_id, None)
 
 
 async def _broadcast_to_clients(message: dict, exclude_client_id: str | None = None) -> None:
@@ -126,12 +153,13 @@ def _build_site_summary() -> dict:
             lbl = str(d.get("label", "")).lower()
             if lbl in ("person", "people"):
                 total_people += 1
-            elif lbl in ("car", "truck", "bus", "motorcycle", "train", "vehicle", "machinery"):
+            elif lbl in ("car", "truck", "bus", "motorcycle", "train", "vehicle", "machinery", "forklift"):
                 total_vehicles += 1
 
-    for thr_list in active_threats_by_client.values():
-        total_threats += len(thr_list)
-        danger_threats += sum(1 for t in thr_list if t.get("level") == "danger")
+    threat_engine.purge_expired_threats()
+    active_thr = list(threat_engine.threats.values())
+    total_threats = len(active_thr)
+    danger_threats = sum(1 for t in active_thr if t.get("level") == "danger")
 
     return {
         "cameras_count": len(clients),
@@ -171,14 +199,64 @@ async def _detection_loop(client_id: str) -> None:
                 {"label": d.label, "confidence": round(d.confidence, 2), "box": [d.x1, d.y1, d.x2, d.y2]}
                 for d in detections
             ]
-            threats_data = [
-                {"level": t.level, "label": t.label, "message": t.message, "box": t.box}
-                for t in threats
-            ]
+            threats_data = []
+
+            # Get observer device pose if available (default origin if testing without GPS)
+            dev_pose = clients.get(client_id, {})
+            obs_lat = dev_pose.get("lat", 23.0225)
+            obs_lon = dev_pose.get("lon", 72.5714)
+            obs_heading = dev_pose.get("heading", 0.0)
+
+            for t in threats:
+                t_lat, t_lon, t_bearing, t_dist = None, None, None, None
+                if t.box:
+                    t_lat, t_lon, t_bearing, t_dist = estimate_threat_coordinates(
+                        obs_lat, obs_lon, obs_heading, t.box, w, fov_deg=70.0
+                    )
+                    # Register in 3-second TTL shared threat store
+                    threat_id = threat_engine.register_threat(
+                        source_client_id=client_id,
+                        threat_lat=t_lat,
+                        threat_lon=t_lon,
+                        level=t.level,
+                        label=t.label,
+                        message=t.message,
+                        box=t.box,
+                        ttl_seconds=3.0
+                    )
+                    
+                    # RUN BLIND-SPOT CHECK AGAINST ALL OTHER CONNECTED DEVICES
+                    blind_alerts = threat_engine.check_blind_spots_for_threat(
+                        threat_engine.threats[threat_id],
+                        clients,
+                        fov_deg=70.0,
+                        max_range_m=40.0
+                    )
+                    for alert in blind_alerts:
+                        # Send alert to target device socket only
+                        await _send_targeted_alert(alert["target_client_id"], alert)
+                        # Also broadcast alert line to dashboard
+                        await _broadcast({
+                            "type": "blind_spot_hazard",
+                            "alert": alert,
+                            "ts": now_ts
+                        })
+
+                threats_data.append({
+                    "level": t.level,
+                    "label": t.label,
+                    "message": t.message,
+                    "box": t.box,
+                    "lat": t_lat,
+                    "lon": t_lon,
+                    "distance_m": t_dist,
+                    "bearing_deg": t_bearing
+                })
+
             latest_detections_by_client[client_id] = detections_data
             active_threats_by_client[client_id] = threats_data
 
-            # Broadcast detections overlay specifically to dashboard
+            # Broadcast detections overlay to dashboard
             await _broadcast({
                 "type": "detections",
                 "client_id": client_id,
@@ -189,7 +267,7 @@ async def _detection_loop(client_id: str) -> None:
                 "ts": now_ts,
             })
 
-            # Check for newly active threats to broadcast site-wide alert across all devices
+            # Check for newly active threats to broadcast site-wide
             current_threat_keys = {f"{t.level}:{t.label}:{t.message}" for t in threats}
             new_keys = current_threat_keys - last_threat_keys
             last_threat_keys = current_threat_keys
@@ -197,8 +275,8 @@ async def _detection_loop(client_id: str) -> None:
             for t in threats:
                 key = f"{t.level}:{t.label}:{t.message}"
                 if key in new_keys:
-                    logger.info("Broadcasting site-wide alert from %s: [%s] %s", client_id, t.level, t.message)
-                    await _broadcast_site_wide({
+                    logger.info("Site hazard spotted by %s: [%s] %s", client_id, t.level, t.message)
+                    await _broadcast({
                         "type": "site_alert",
                         "source_client_id": client_id,
                         "level": t.level,
@@ -208,14 +286,11 @@ async def _detection_loop(client_id: str) -> None:
                         "ts": now_ts,
                     })
 
-            # Periodically (or on threat changes), synchronize shared worksite perception
+            # Periodically synchronize shared worksite perception
             if new_keys or (now_ts - last_perception_sync >= 1.5):
                 last_perception_sync = now_ts
-                all_threats = [
-                    {"source_client_id": cid, "level": t["level"], "label": t["label"], "message": t["message"]}
-                    for cid, t_list in active_threats_by_client.items()
-                    for t in t_list
-                ]
+                threat_engine.purge_expired_threats(now_ts)
+                all_threats = list(threat_engine.threats.values())
                 await _broadcast_site_wide({
                     "type": "site_perception",
                     "clients": list(clients.keys()),
@@ -230,49 +305,100 @@ async def _detection_loop(client_id: str) -> None:
 @app.websocket("/ws/stream/{client_id}")
 async def stream_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
-    clients[client_id] = {"last_seen": time.time()}
+    # Initialize client state with default pose if not sent
+    clients[client_id] = {
+        "client_id": client_id,
+        "lat": 23.0225,
+        "lon": 72.5714,
+        "heading": 0.0,
+        "last_seen": time.time()
+    }
     client_sockets[client_id] = websocket
     detection_tasks[client_id] = asyncio.create_task(_detection_loop(client_id))
 
     logger.info("Client connected: %s", client_id)
     await _broadcast_site_wide({"type": "client_online", "client_id": client_id})
 
-    # Send initial site perception snapshot to the newly connected client
-    all_threats = [
-        {"source_client_id": cid, "level": t["level"], "label": t["label"], "message": t["message"]}
-        for cid, t_list in active_threats_by_client.items()
-        for t in t_list
-    ]
-    await _broadcast_site_wide({
-        "type": "site_perception",
-        "clients": list(clients.keys()),
-        "active_threats": all_threats,
-        "summary": _build_site_summary(),
-        "ts": time.time(),
-    })
-
     min_interval = 1.0 / settings.VIDEO_RELAY_FPS
     last_relay_ts = 0.0
 
     try:
         while True:
-            data = await websocket.receive_bytes()
+            # Can receive raw video bytes OR JSON telemetry/threat packets
+            message = await websocket.receive()
             now = time.time()
-            if client_id in clients:
-                clients[client_id]["last_seen"] = now
-            raw_frame_store[client_id] = data
 
-            if now - last_relay_ts < min_interval:
-                continue
-            last_relay_ts = now
+            if "bytes" in message and message["bytes"]:
+                data = message["bytes"]
+                if client_id in clients:
+                    clients[client_id]["last_seen"] = now
+                raw_frame_store[client_id] = data
 
-            image_b64 = base64.b64encode(data).decode("ascii")
-            await _broadcast({
-                "type": "video_frame",
-                "client_id": client_id,
-                "image": image_b64,
-                "ts": now,
-            })
+                if now - last_relay_ts < min_interval:
+                    continue
+                last_relay_ts = now
+
+                image_b64 = base64.b64encode(data).decode("ascii")
+                await _broadcast({
+                    "type": "video_frame",
+                    "client_id": client_id,
+                    "image": image_b64,
+                    "ts": now,
+                })
+
+            elif "text" in message and message["text"]:
+                try:
+                    payload = json.loads(message["text"])
+                    p_type = payload.get("type")
+
+                    # Handle telemetry update (lat, lon, heading from phone GPS/IMU)
+                    if p_type in ("telemetry", "pose", "phone_pose"):
+                        if client_id not in clients:
+                            clients[client_id] = {"client_id": client_id}
+                        clients[client_id].update({
+                            "lat": payload.get("lat", clients[client_id].get("lat", 23.0225)),
+                            "lon": payload.get("lon", clients[client_id].get("lon", 72.5714)),
+                            "heading": payload.get("heading", payload.get("heading_deg", 0.0)),
+                            "last_seen": now
+                        })
+
+                    # Handle explicit threat message from phone client
+                    elif p_type == "threat":
+                        obs_lat = payload.get("lat", clients.get(client_id, {}).get("lat", 23.0225))
+                        obs_lon = payload.get("lon", clients.get(client_id, {}).get("lon", 72.5714))
+                        obs_heading = payload.get("heading", clients.get(client_id, {}).get("heading", 0.0))
+                        bearing_offset = payload.get("bearing_offset", 0.0)
+                        distance_est = payload.get("distance_est", 14.0)
+                        threat_label = payload.get("class", payload.get("label", "Threat"))
+
+                        # Compute threat global coordinate
+                        t_bearing = (obs_heading + bearing_offset + 360.0) % 360.0
+                        t_lat, t_lon = project_coordinates(obs_lat, obs_lon, t_bearing, distance_est)
+
+                        # Register in 3-second TTL store
+                        threat_id = threat_engine.register_threat(
+                            source_client_id=client_id,
+                            threat_lat=t_lat,
+                            threat_lon=t_lon,
+                            level="danger",
+                            label=threat_label,
+                            message=f"Threat detected at bearing {round(t_bearing)}° ({distance_est}m)",
+                            ttl_seconds=3.0
+                        )
+
+                        # Check FOV against all other connected devices
+                        blind_alerts = threat_engine.check_blind_spots_for_threat(
+                            threat_engine.threats[threat_id],
+                            clients,
+                            fov_deg=70.0,
+                            max_range_m=40.0
+                        )
+                        for alert in blind_alerts:
+                            await _send_targeted_alert(alert["target_client_id"], alert)
+
+                except json.JSONDecodeError:
+                    pass
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -288,18 +414,6 @@ async def stream_endpoint(websocket: WebSocket, client_id: str):
         latest_detections_by_client.pop(client_id, None)
 
         await _broadcast_site_wide({"type": "client_offline", "client_id": client_id})
-        all_threats = [
-            {"source_client_id": cid, "level": t["level"], "label": t["label"], "message": t["message"]}
-            for cid, t_list in active_threats_by_client.items()
-            for t in t_list
-        ]
-        await _broadcast_site_wide({
-            "type": "site_perception",
-            "clients": list(clients.keys()),
-            "active_threats": all_threats,
-            "summary": _build_site_summary(),
-            "ts": time.time(),
-        })
         logger.info("Client disconnected: %s", client_id)
 
 
@@ -308,21 +422,17 @@ async def dashboard_ws(websocket: WebSocket):
     await websocket.accept()
     dashboards.add(websocket)
     try:
-        all_threats = [
-            {"source_client_id": cid, "level": t["level"], "label": t["label"], "message": t["message"]}
-            for cid, t_list in active_threats_by_client.items()
-            for t in t_list
-        ]
+        threat_engine.purge_expired_threats()
         await websocket.send_text(json.dumps({
             "type": "roster",
             "clients": list(clients.keys()),
-            "active_threats": all_threats,
+            "devices": clients,
+            "active_threats": list(threat_engine.threats.values()),
             "summary": _build_site_summary(),
         }))
         while True:
-            await websocket.receive_text()  # dashboard doesn't send anything meaningful; keeps the socket alive
+            await websocket.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
         dashboards.discard(websocket)
-

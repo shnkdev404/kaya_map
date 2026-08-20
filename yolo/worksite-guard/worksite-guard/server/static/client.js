@@ -221,7 +221,20 @@ function openSocket(clientId) {
     if (typeof event.data === "string") {
       try {
         const msg = JSON.parse(event.data);
-        if (msg.type === "site_alert") {
+        if (msg.type === "blind_spot_alert") {
+          // TARGETED BLIND-SPOT HAZARD ALERT
+          showSiteAlertBanner({
+            level: msg.level || "danger",
+            source_client_id: msg.source_client_id,
+            label: "🚨 BLIND-SPOT HAZARD",
+            message: msg.message || `Threat detected in your blind spot (${msg.distance_m}m away) by ${msg.source_client_id}!`
+          });
+          addAlertToLog({
+            level: "danger",
+            source_client_id: msg.source_client_id,
+            message: `🚨 BLIND-SPOT HAZARD: ${msg.message || 'Approaching from behind/flank'}`
+          });
+        } else if (msg.type === "site_alert") {
           showSiteAlertBanner(msg);
           addAlertToLog(msg);
         } else if (msg.type === "site_perception") {

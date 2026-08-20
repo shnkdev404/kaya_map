@@ -1,11 +1,23 @@
-import { DeviceTelemetry, BlindSpotAlert } from "./types";
-import { calculateFovPolygon, projectThreatToGlobal, checkBlindSpotThreats } from "./geo";
+import { DeviceTelemetry, BlindSpotAlert, ThreatDetection } from "./types";
+import { calculateFovPolygon, projectThreatToGlobal, checkBlindSpotThreats, isOutsideFov } from "./geo";
+
+interface StoredThreat {
+  threat_id: string;
+  source_id: string;
+  threat_lat: number;
+  threat_lon: number;
+  label: string;
+  level: string;
+  created_at: number;
+  expires_at: number;
+}
 
 // Global telemetry store and subscriber registry across Next.js requests
 const globalStore = globalThis as unknown as {
   telemetryStore?: Record<string, DeviceTelemetry>;
   telemetrySubscribers?: Set<(data: any) => void>;
   activeBlindSpotAlerts?: BlindSpotAlert[];
+  threatsStore?: Record<string, StoredThreat>;
 };
 
 if (!globalStore.telemetryStore) {
@@ -16,6 +28,9 @@ if (!globalStore.telemetrySubscribers) {
 }
 if (!globalStore.activeBlindSpotAlerts) {
   globalStore.activeBlindSpotAlerts = [];
+}
+if (!globalStore.threatsStore) {
+  globalStore.threatsStore = {};
 }
 
 export function broadcastTelemetryUpdate(data: any) {
@@ -36,13 +51,24 @@ export function getActiveBlindSpotAlerts(): BlindSpotAlert[] {
   return globalStore.activeBlindSpotAlerts || [];
 }
 
+export function purgeExpiredThreats(ttlSeconds = 3.0) {
+  const now = Date.now();
+  if (globalStore.threatsStore) {
+    Object.keys(globalStore.threatsStore).forEach((tid) => {
+      if (now > globalStore.threatsStore![tid].expires_at) {
+        delete globalStore.threatsStore![tid];
+      }
+    });
+  }
+}
+
 export function processTelemetryPacket(rawPayload: any): {
   device: DeviceTelemetry;
   blindSpotAlerts: BlindSpotAlert[];
 } {
   const deviceId = rawPayload.agent_id || rawPayload.device_id || "unknown";
   const heading = rawPayload.heading_deg ?? rawPayload.heading ?? 0;
-  const hfov = rawPayload.camera_hfov_deg ?? 68;
+  const hfov = rawPayload.camera_hfov_deg ?? 70;
   const pitch = rawPayload.pitch_deg ?? rawPayload.pitch ?? 0;
 
   // 1. Calculate Field of View (FOV) polygon
@@ -51,23 +77,49 @@ export function processTelemetryPacket(rawPayload: any): {
     rawPayload.lon,
     heading,
     hfov,
-    50
+    40
   );
 
   // 2. Project all detections to global coordinates
-  const projectedThreats = (rawPayload.detections || []).map((det: any) => {
-    const [gLat, gLon] = projectThreatToGlobal(
-      rawPayload.lat,
-      rawPayload.lon,
-      heading,
-      det
-    );
+  const now = Date.now();
+  const projectedThreats: ThreatDetection[] = (rawPayload.detections || []).map((det: any) => {
+    let gLat = det.globalLat;
+    let gLon = det.globalLon;
+
+    if (!gLat || !gLon) {
+      const [pLat, pLon] = projectThreatToGlobal(
+        rawPayload.lat,
+        rawPayload.lon,
+        heading,
+        det
+      );
+      gLat = pLat;
+      gLon = pLon;
+    }
+
+    // Register in 3-second TTL threats store
+    const threatKey = `thr:${deviceId}:${det.class || 'threat'}`;
+    if (globalStore.threatsStore) {
+      globalStore.threatsStore[threatKey] = {
+        threat_id: threatKey,
+        source_id: deviceId,
+        threat_lat: gLat,
+        threat_lon: gLon,
+        label: det.class || 'threat',
+        level: 'danger',
+        created_at: now,
+        expires_at: now + 3000 // 3 seconds TTL
+      };
+    }
+
     return {
       ...det,
       globalLat: gLat,
       globalLon: gLon
     };
   });
+
+  purgeExpiredThreats();
 
   const existing = globalStore.telemetryStore?.[deviceId];
   const history = existing?.history || [];
@@ -104,9 +156,9 @@ export function processTelemetryPacket(rawPayload: any): {
     globalStore.telemetryStore[deviceId] = devicePayload;
   }
 
-  // 3. Run Point-in-Polygon Blind-Spot Engine across all active agents
+  // 3. Run FOV Blind-Spot Check (70° FOV cone, 40m max range)
   const activeAgents = Object.values(globalStore.telemetryStore || {});
-  const alerts = checkBlindSpotThreats(activeAgents, 60);
+  const alerts = checkBlindSpotThreats(activeAgents, 40, 70);
   globalStore.activeBlindSpotAlerts = alerts;
 
   return {
@@ -130,6 +182,7 @@ export function removeTelemetryDevice(deviceId: string) {
 export function clearAllTelemetry() {
   globalStore.telemetryStore = {};
   globalStore.activeBlindSpotAlerts = [];
+  globalStore.threatsStore = {};
 }
 
 export function addTelemetrySubscriber(cb: (data: any) => void) {
